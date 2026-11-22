@@ -1,0 +1,9 @@
+build/
+*.olean
+*.o
+*.a
+*.so
+*.dylib
+*.fir
+__pycache__/
+.DS_Store
