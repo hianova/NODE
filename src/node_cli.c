@@ -1,5 +1,7 @@
 #include "node.h"
 #include "node_cert.h"
+#include "node_disk_wal.h"
+#include "node_net_udp.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -25,6 +27,9 @@ static node_raft_cluster_t g_raft;
 static node_bft_cluster_t g_bft;
 static node_cert_ws_t g_cert_ws;
 static NodeArena g_arena;
+static node_dbsp_reach_t g_reach;
+static node_dyn_tri_t g_tri;
+static node_replay_win_t g_win;
 
 static void build_demo_vm_prog(node_vm_prog_t *prog) {
     memset(prog, 0, sizeof(*prog));
@@ -556,11 +561,132 @@ static bool test_15_certs_fir_eval(void) {
     return true;
 }
 
+static bool test_16_replay_kdf_wire(void) {
+    node_replay_win_init(&g_win, 5U);
+    if (!node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(100)) ||
+        node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(100)) ||
+        !node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(80)) ||
+        node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(80)) ||
+        node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(36)) ||
+        node_replay_win_check_and_mark(&g_win, 4U, UINT64_C(101)) ||
+        !node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(200)) ||
+        node_replay_win_check_and_mark(&g_win, 5U, UINT64_C(135))) {
+        return false;
+    }
+
+    uint64_t psk = UINT64_C(0xDEADBEEFCAFEBABE);
+    uint64_t k1 =
+        node_session_derive_key(psk, 1U, 2U, UINT64_C(11), UINT64_C(22), 5U, 0x03U, 0x02U);
+    uint64_t k2 =
+        node_session_derive_key(psk, 1U, 2U, UINT64_C(11), UINT64_C(22), 5U, 0x03U, 0x02U);
+    uint64_t k_mitm =
+        node_session_derive_key(psk, 99U, 2U, UINT64_C(11), UINT64_C(22), 5U, 0x03U, 0x02U);
+    uint64_t k_downgrade =
+        node_session_derive_key(psk, 1U, 2U, UINT64_C(11), UINT64_C(22), 5U, 0x03U, 0x01U);
+    if (k1 != k2 || k1 == k_mitm || k1 == k_downgrade) {
+        return false;
+    }
+
+    uint8_t msg[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    uint8_t frame[NODE_WIRE_HDR_BYTES + NODE_WIRE_MAX_PAYLOAD];
+    uint8_t out[NODE_WIRE_MAX_PAYLOAD];
+    size_t flen = node_net_wire_frame_encode(k1, 5U, UINT64_C(201), 0x03U, 0x02U, msg, sizeof(msg),
+                                             frame, sizeof(frame));
+    if (flen != NODE_WIRE_HDR_BYTES + sizeof(msg)) {
+        return false;
+    }
+    size_t out_len = 0U;
+    uint64_t out_seq = UINT64_C(0);
+    if (!node_net_wire_frame_decode_verify(k1, &g_win, frame, flen, out, sizeof(out), &out_len,
+                                           &out_seq) ||
+        out_len != sizeof(msg) || out_seq != UINT64_C(201) || memcmp(msg, out, sizeof(msg)) != 0) {
+        return false;
+    }
+    /* Duplicate replay must be rejected */
+    if (node_net_wire_frame_decode_verify(k1, &g_win, frame, flen, out, sizeof(out), &out_len,
+                                          &out_seq)) {
+        return false;
+    }
+    /* Tampered payload on seq 202 must fail MAC verification without accepting seq 202 */
+    flen = node_net_wire_frame_encode(k1, 5U, UINT64_C(202), 0x03U, 0x02U, msg, sizeof(msg), frame,
+                                      sizeof(frame));
+    frame[NODE_WIRE_HDR_BYTES] ^= UINT8_C(0x80);
+    if (node_net_wire_frame_decode_verify(k1, &g_win, frame, flen, out, sizeof(out), &out_len,
+                                          &out_seq)) {
+        return false;
+    }
+    frame[NODE_WIRE_HDR_BYTES] ^= UINT8_C(0x80);
+    return node_net_wire_frame_decode_verify(k1, &g_win, frame, flen, out, sizeof(out), &out_len,
+                                             &out_seq);
+}
+
+static uint64_t brute_tri_count(const node_dyn_tri_t *st) {
+    uint64_t cnt = UINT64_C(0);
+    for (uint32_t a = 0U; a < st->num_verts; ++a) {
+        for (uint32_t b = a + 1U; b < st->num_verts; ++b) {
+            if (((st->adj[a] >> b) & UINT64_C(1)) == UINT64_C(0)) {
+                continue;
+            }
+            for (uint32_t c = b + 1U; c < st->num_verts; ++c) {
+                if (((st->adj[a] >> c) & UINT64_C(1)) != UINT64_C(0) &&
+                    ((st->adj[b] >> c) & UINT64_C(1)) != UINT64_C(0)) {
+                    cnt++;
+                }
+            }
+        }
+    }
+    return cnt;
+}
+
+static bool test_17_dbsp_reach_dyntri(void) {
+    node_dbsp_reach_init(&g_reach, 10U);
+    const uint32_t edges[][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 1}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {0, 8}, {8, 9},
+    };
+    for (size_t i = 0U; i < sizeof(edges) / sizeof(edges[0]); ++i) {
+        if (!node_dbsp_reach_insert_edge(&g_reach, edges[i][0], edges[i][1])) {
+            return false;
+        }
+    }
+    uint32_t iters = 0U;
+    uint64_t r0 = node_dbsp_reach_from(&g_reach, 0U, &iters);
+    uint64_t r4 = node_dbsp_reach_from(&g_reach, 4U, &iters);
+    if (r0 != UINT64_C(0x3FF) || r4 != UINT64_C(0xF0)) {
+        return false;
+    }
+
+    node_dyn_tri_init(&g_tri, 12U);
+    const uint32_t ops[][3] = {
+        {0, 1, 1}, {1, 2, 1}, {0, 2, 1}, {2, 3, 1}, {0, 3, 1}, {1, 3, 1}, {3, 4, 1}, {2, 4, 1},
+        {0, 4, 1}, {0, 2, 0}, {1, 3, 0}, {3, 4, 0}, {4, 5, 1}, {3, 5, 1}, {2, 5, 1}, {3, 4, 1},
+    };
+    for (size_t i = 0U; i < sizeof(ops) / sizeof(ops[0]); ++i) {
+        int32_t pm = (ops[i][2] == 1U) ? 1 : -1;
+        uint64_t got = node_dyn_tri_apply_edge(&g_tri, ops[i][0], ops[i][1], pm);
+        if (got != brute_tri_count(&g_tri)) {
+            return false;
+        }
+    }
+    return g_tri.triangles == brute_tri_count(&g_tri);
+}
+
+static bool test_18_udp_disk_info(void) {
+    node_udp_bench_report_t udp_rep;
+    if (!node_host_udp_loopback_run(64U, &udp_rep)) {
+        return false;
+    }
+    node_disk_wal_report_t disk_rep;
+    if (!node_host_disk_wal_run("/tmp/node_selftest_wal", 64U, &disk_rep)) {
+        return false;
+    }
+    return udp_rep.passed && disk_rep.passed;
+}
+
 static int run_selftest(void) {
     struct {
         const char *name;
         bool (*fn)(void);
-    } suites[15] = {
+    } suites[18] = {
         {"01_vm_caps", test_01_vm_caps},
         {"02_vm_attenuate", test_02_vm_attenuate},
         {"03_vm_fuel_replay", test_03_vm_fuel_replay},
@@ -576,9 +702,12 @@ static int run_selftest(void) {
         {"13_pncounter_merge_dups", test_13_pncounter_merge_dups},
         {"14_arena_schema_fill", test_14_arena_schema_fill},
         {"15_certs_sanity", test_15_certs_fir_eval},
+        {"16_replay_kdf_wire", test_16_replay_kdf_wire},
+        {"17_dbsp_reach_dyntri", test_17_dbsp_reach_dyntri},
+        {"18_udp_disk_info", test_18_udp_disk_info},
     };
     int fails = 0;
-    for (int i = 0; i < 15; ++i) {
+    for (int i = 0; i < 18; ++i) {
         bool ok = suites[i].fn();
         printf("[NODE SELFTEST] %-24s : %s\n", suites[i].name, ok ? "PASS" : "FAIL");
         if (!ok) {
@@ -933,11 +1062,47 @@ static int cmd_audit_replay(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_udp_loopback(uint32_t count) {
+    node_udp_bench_report_t rep;
+    bool ok = node_host_udp_loopback_run(count, &rep);
+    printf("{\n");
+    printf("  \"port\": %u,\n", (unsigned)rep.port);
+    printf("  \"sent_ok\": %u,\n", rep.sent_ok);
+    printf("  \"recv_ok\": %u,\n", rep.recv_ok);
+    printf("  \"replay_rejected\": %u,\n", rep.replay_rejected);
+    printf("  \"tamper_rejected\": %u,\n", rep.tamper_rejected);
+    printf("  \"post_attack_ok\": %u,\n", rep.post_attack_ok);
+    printf("  \"elapsed_us\": %" PRIu64 ",\n", rep.elapsed_us);
+    printf("  \"passed\": %s\n", ok ? "true" : "false");
+    printf("}\n");
+    return ok ? 0 : 1;
+}
+
+static int cmd_disk_compact(const char *dir_path) {
+    node_disk_wal_report_t rep;
+    bool ok = node_host_disk_wal_run(dir_path, 96U, &rep);
+    printf("{\n");
+    printf("  \"dir\": \"%s\",\n", dir_path);
+    printf("  \"records_written\": %u,\n", rep.records_written);
+    printf("  \"segments_written\": %u,\n", rep.segments_written);
+    printf("  \"recovered_records\": %u,\n", rep.recovered_records);
+    printf("  \"torn_rejected\": %u,\n", rep.torn_rejected);
+    printf("  \"raw_snap_bytes\": %u,\n", rep.raw_snap_bytes);
+    printf("  \"compressed_snap_bytes\": %u,\n", rep.compressed_snap_bytes);
+    printf("  \"codec\": \"%s\",\n", rep.have_info_codec ? "INFO_INF1" : "RLE_FALLBACK");
+    printf("  \"roundtrip_exact\": %s,\n", rep.roundtrip_exact ? "true" : "false");
+    printf("  \"elapsed_us\": %" PRIu64 ",\n", rep.elapsed_us);
+    printf("  \"passed\": %s\n", ok ? "true" : "false");
+    printf("}\n");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(
             stderr,
-            "Usage: %s <selftest|vm-demo|dbsp-demo|wal-audit|dst|audit-replay|emit-certs DIR>\n",
+            "Usage: %s "
+            "<selftest|vm-demo|dbsp-demo|wal-audit|dst|udp-loopback|disk-compact|audit-replay|emit-certs DIR>\n",
             argv[0]);
         return 1;
     }
@@ -955,6 +1120,14 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "dst") == 0) {
         return cmd_dst(argc, argv);
+    }
+    if (strcmp(argv[1], "udp-loopback") == 0) {
+        uint32_t n = (argc >= 3) ? (uint32_t)strtoul(argv[2], NULL, 0) : 256U;
+        return cmd_udp_loopback(n);
+    }
+    if (strcmp(argv[1], "disk-compact") == 0) {
+        const char *dir = (argc >= 3) ? argv[2] : "/tmp/node_disk_wal";
+        return cmd_disk_compact(dir);
     }
     if (strcmp(argv[1], "audit-replay") == 0) {
         return cmd_audit_replay(argc, argv);

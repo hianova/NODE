@@ -281,6 +281,34 @@ typedef struct {
     uint64_t state_root;
 } node_dst_report_t;
 
+#define NODE_WIRE_MAGIC       UINT32_C(0x4E445732)
+#define NODE_WIRE_MAX_PAYLOAD 128U
+#define NODE_WIRE_HDR_BYTES   32U
+#define NODE_REACH_MAX_V      64U
+
+typedef struct {
+    uint64_t max_seq;
+    uint64_t bitmap;
+    uint32_t epoch;
+    uint32_t initialized;
+    uint64_t accepted;
+    uint64_t rejected;
+} node_replay_win_t;
+
+typedef struct {
+    uint32_t num_verts;
+    uint32_t pad;
+    uint64_t adj[NODE_REACH_MAX_V];
+} node_dbsp_reach_t;
+
+typedef struct {
+    uint32_t num_verts;
+    uint32_t pad;
+    uint64_t triangles;
+    uint64_t edge_ops;
+    uint64_t adj[NODE_REACH_MAX_V];
+} node_dyn_tri_t;
+
 /* --- Public Pure-GPR API --- */
 
 void node_vm_init(node_vm_t *vm, uint32_t fuel_budget);
@@ -366,6 +394,27 @@ uint64_t node_ct_select_u64(uint64_t a, uint64_t b, uint32_t sel_bit);
 void node_ct_cswap32(uint8_t a[32], uint8_t b[32], uint32_t swap_bit);
 void node_net_msg_mac(const uint8_t key[32], const node_net_msg_t *msg, uint8_t tag_out[32]);
 bool node_net_msg_verify(const uint8_t key[32], const node_net_msg_t *msg, const uint8_t tag[32]);
+
+void node_replay_win_init(node_replay_win_t *w, uint32_t epoch);
+bool node_replay_win_check_and_mark(node_replay_win_t *w, uint32_t epoch, uint64_t seq);
+uint64_t node_session_derive_key(uint64_t psk, uint32_t id_a, uint32_t id_b, uint64_t nonce_a,
+                                 uint64_t nonce_b, uint32_t epoch, uint8_t caps_offered,
+                                 uint8_t negotiated_ver);
+size_t node_net_wire_frame_encode(uint64_t session_key, uint32_t epoch, uint64_t seq,
+                                  uint8_t caps_offered, uint8_t negotiated_ver,
+                                  const uint8_t *payload, size_t payload_len, uint8_t *out_buf,
+                                  size_t out_cap);
+bool node_net_wire_frame_decode_verify(uint64_t session_key, node_replay_win_t *win,
+                                       const uint8_t *frame, size_t frame_len, uint8_t *payload_out,
+                                       size_t payload_cap, size_t *payload_len_out,
+                                       uint64_t *seq_out);
+
+void node_dbsp_reach_init(node_dbsp_reach_t *st, uint32_t num_verts);
+bool node_dbsp_reach_insert_edge(node_dbsp_reach_t *st, uint32_t u, uint32_t v);
+uint64_t node_dbsp_reach_from(const node_dbsp_reach_t *st, uint32_t src, uint32_t *iters_out);
+
+void node_dyn_tri_init(node_dyn_tri_t *st, uint32_t num_verts);
+uint64_t node_dyn_tri_apply_edge(node_dyn_tri_t *st, uint32_t u, uint32_t v, int32_t delta_pm1);
 
 #ifdef __cplusplus
 }

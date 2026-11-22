@@ -1772,3 +1772,294 @@ void node_arena_fill_summary(NodeArena *arena, const node_vm_t *vm,
         arena->map.dst_meta[0].min_witness_tick = dst->min_witness_tick;
     }
 }
+
+/* ============================================================================
+ * NODE v2.0 — Anti-Replay Window, Constant-Time Session KDF, Wire Framing,
+ *             Recursive DBSP Reachability & Incremental Dynamic Triangles
+ * ============================================================================ */
+
+static void node_store_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & UINT32_C(0xFF));
+    p[1] = (uint8_t)((v >> 8U) & UINT32_C(0xFF));
+    p[2] = (uint8_t)((v >> 16U) & UINT32_C(0xFF));
+    p[3] = (uint8_t)((v >> 24U) & UINT32_C(0xFF));
+}
+
+static uint32_t node_load_le32(const uint8_t *p) {
+    return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8U) | ((uint32_t)p[2] << 16U) |
+           ((uint32_t)p[3] << 24U);
+}
+
+static void node_store_le16(uint8_t *p, uint16_t v) {
+    uint32_t uv = (uint32_t)v;
+    p[0] = (uint8_t)(uv & UINT32_C(0xFF));
+    p[1] = (uint8_t)((uv >> 8U) & UINT32_C(0xFF));
+}
+
+static uint16_t node_load_le16(const uint8_t *p) {
+    return (uint16_t)(((uint32_t)p[0]) | (((uint32_t)p[1]) << 8U));
+}
+
+static void node_store_le64(uint8_t *p, uint64_t v) {
+    for (uint32_t i = 0U; i < 8U; ++i) {
+        p[i] = (uint8_t)((v >> (i * 8U)) & UINT64_C(0xFF));
+    }
+}
+
+static uint64_t node_load_le64(const uint8_t *p) {
+    uint64_t acc = UINT64_C(0);
+    for (uint32_t i = 0U; i < 8U; ++i) {
+        acc |= ((uint64_t)p[i]) << (i * 8U);
+    }
+    return acc;
+}
+
+static uint64_t node_splitmix64_mix(uint64_t x) {
+    x += UINT64_C(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30U)) * UINT64_C(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27U)) * UINT64_C(0x94D049BB133111EB);
+    return x ^ (x >> 31U);
+}
+
+static uint64_t node_popcount_u64(uint64_t x) {
+    x -= (x >> 1U) & UINT64_C(0x5555555555555555);
+    x = (x & UINT64_C(0x3333333333333333)) + ((x >> 2U) & UINT64_C(0x3333333333333333));
+    x = (x + (x >> 4U)) & UINT64_C(0x0F0F0F0F0F0F0F0F);
+    return (x * UINT64_C(0x0101010101010101)) >> 56U;
+}
+
+void node_replay_win_init(node_replay_win_t *w, uint32_t epoch) {
+    if (w == NULL) {
+        return;
+    }
+    node_zero_bytes(w, sizeof(*w));
+    w->epoch = epoch;
+}
+
+bool node_replay_win_check_and_mark(node_replay_win_t *w, uint32_t epoch, uint64_t seq) {
+    if (w == NULL) {
+        return false;
+    }
+    if (w->initialized == 0U) {
+        w->epoch = epoch;
+        w->max_seq = seq;
+        w->bitmap = UINT64_C(1);
+        w->initialized = 1U;
+        w->accepted++;
+        return true;
+    }
+    if (epoch != w->epoch) {
+        w->rejected++;
+        return false;
+    }
+    if (seq > w->max_seq) {
+        uint64_t shift = seq - w->max_seq;
+        if (shift >= UINT64_C(64)) {
+            w->bitmap = UINT64_C(1);
+        } else {
+            w->bitmap = (w->bitmap << shift) | UINT64_C(1);
+        }
+        w->max_seq = seq;
+        w->accepted++;
+        return true;
+    }
+    uint64_t diff = w->max_seq - seq;
+    if (diff >= UINT64_C(64)) {
+        w->rejected++;
+        return false;
+    }
+    uint64_t mask = UINT64_C(1) << diff;
+    if ((w->bitmap & mask) != UINT64_C(0)) {
+        w->rejected++;
+        return false;
+    }
+    w->bitmap |= mask;
+    w->accepted++;
+    return true;
+}
+
+uint64_t node_session_derive_key(uint64_t psk, uint32_t id_a, uint32_t id_b, uint64_t nonce_a,
+                                 uint64_t nonce_b, uint32_t epoch, uint8_t caps_offered,
+                                 uint8_t negotiated_ver) {
+    /* Straight-line branchless ARX / SplitMix transcript-bound key derivation (Auditor CT verified)
+     */
+    uint64_t ids = ((uint64_t)id_a) | (((uint64_t)id_b) << 32U);
+    uint64_t meta = ((uint64_t)epoch) | (((uint64_t)caps_offered) << 32U) |
+                    (((uint64_t)negotiated_ver) << 40U) | UINT64_C(0x4E32000000000000);
+    uint64_t s0 = node_splitmix64_mix(psk ^ ids);
+    uint64_t s1 = node_splitmix64_mix(s0 ^ nonce_a);
+    uint64_t s2 = node_splitmix64_mix(s1 ^ nonce_b);
+    uint64_t s3 = node_splitmix64_mix(s2 ^ meta ^ psk);
+    return s3 ^ ((s1 << 19U) | (s1 >> 45U)) ^ s0;
+}
+
+static uint64_t node_wire_compute_mac64(uint64_t session_key, const uint8_t *hdr24,
+                                        const uint8_t *payload, size_t payload_len) {
+    flow_sha256_ctx_t ctx;
+    uint8_t key_le[8];
+    uint8_t digest[32];
+    uint8_t dom[4] = {UINT8_C('N'), UINT8_C('D'), UINT8_C('W'), UINT8_C('2')};
+    node_zero_bytes(&ctx, sizeof(ctx));
+    node_zero_bytes(digest, sizeof(digest));
+    node_store_le64(key_le, session_key);
+    flow_sha256_init(&ctx);
+    flow_sha256_update(&ctx, dom, sizeof(dom));
+    flow_sha256_update(&ctx, key_le, sizeof(key_le));
+    flow_sha256_update(&ctx, hdr24, 24U);
+    if (payload != NULL && payload_len > 0U) {
+        flow_sha256_update(&ctx, payload, payload_len);
+    }
+    flow_sha256_final(&ctx, digest);
+    return node_load_le64(digest);
+}
+
+size_t node_net_wire_frame_encode(uint64_t session_key, uint32_t epoch, uint64_t seq,
+                                  uint8_t caps_offered, uint8_t negotiated_ver,
+                                  const uint8_t *payload, size_t payload_len, uint8_t *out_buf,
+                                  size_t out_cap) {
+    if (out_buf == NULL || payload_len > NODE_WIRE_MAX_PAYLOAD ||
+        out_cap < (NODE_WIRE_HDR_BYTES + payload_len)) {
+        return 0U;
+    }
+    if (payload_len > 0U && payload == NULL) {
+        return 0U;
+    }
+    node_store_le32(&out_buf[0], NODE_WIRE_MAGIC);
+    out_buf[4] = negotiated_ver;
+    out_buf[5] = caps_offered;
+    node_store_le16(&out_buf[6], (uint16_t)payload_len);
+    node_store_le32(&out_buf[8], epoch);
+    node_store_le32(&out_buf[12], UINT32_C(0));
+    node_store_le64(&out_buf[16], seq);
+    uint64_t mac = node_wire_compute_mac64(session_key, out_buf, payload, payload_len);
+    node_store_le64(&out_buf[24], mac);
+    if (payload_len > 0U) {
+        node_copy_bytes(&out_buf[NODE_WIRE_HDR_BYTES], payload, payload_len);
+    }
+    return NODE_WIRE_HDR_BYTES + payload_len;
+}
+
+bool node_net_wire_frame_decode_verify(uint64_t session_key, node_replay_win_t *win,
+                                       const uint8_t *frame, size_t frame_len, uint8_t *payload_out,
+                                       size_t payload_cap, size_t *payload_len_out,
+                                       uint64_t *seq_out) {
+    if (frame == NULL || frame_len < NODE_WIRE_HDR_BYTES) {
+        return false;
+    }
+    if (node_load_le32(&frame[0]) != NODE_WIRE_MAGIC) {
+        return false;
+    }
+    uint16_t plen = node_load_le16(&frame[6]);
+    if (plen > NODE_WIRE_MAX_PAYLOAD || frame_len != (NODE_WIRE_HDR_BYTES + (size_t)plen)) {
+        return false;
+    }
+    uint32_t epoch = node_load_le32(&frame[8]);
+    uint64_t seq = node_load_le64(&frame[16]);
+    uint64_t wire_mac = node_load_le64(&frame[24]);
+    const uint8_t *payload_ptr = (plen > 0U) ? &frame[NODE_WIRE_HDR_BYTES] : NULL;
+    uint64_t calc_mac = node_wire_compute_mac64(session_key, frame, payload_ptr, (size_t)plen);
+    if (!node_ct_eq_u64(wire_mac, calc_mac)) {
+        return false;
+    }
+    if (win != NULL && !node_replay_win_check_and_mark(win, epoch, seq)) {
+        return false;
+    }
+    if (payload_out != NULL && plen > 0U) {
+        if (payload_cap < (size_t)plen) {
+            return false;
+        }
+        node_copy_bytes(payload_out, payload_ptr, (size_t)plen);
+    }
+    if (payload_len_out != NULL) {
+        *payload_len_out = (size_t)plen;
+    }
+    if (seq_out != NULL) {
+        *seq_out = seq;
+    }
+    return true;
+}
+
+void node_dbsp_reach_init(node_dbsp_reach_t *st, uint32_t num_verts) {
+    if (st == NULL) {
+        return;
+    }
+    node_zero_bytes(st, sizeof(*st));
+    st->num_verts = (num_verts > NODE_REACH_MAX_V) ? NODE_REACH_MAX_V : num_verts;
+}
+
+bool node_dbsp_reach_insert_edge(node_dbsp_reach_t *st, uint32_t u, uint32_t v) {
+    if (st == NULL || u >= st->num_verts || v >= st->num_verts || u >= NODE_REACH_MAX_V ||
+        v >= NODE_REACH_MAX_V) {
+        return false;
+    }
+    st->adj[u] |= (UINT64_C(1) << v);
+    return true;
+}
+
+uint64_t node_dbsp_reach_from(const node_dbsp_reach_t *st, uint32_t src, uint32_t *iters_out) {
+    if (st == NULL || src >= st->num_verts || src >= NODE_REACH_MAX_V) {
+        if (iters_out != NULL) {
+            *iters_out = 0U;
+        }
+        return UINT64_C(0);
+    }
+    uint64_t visited = (UINT64_C(1) << src);
+    uint64_t frontier = visited;
+    uint32_t iters = 0U;
+    while (frontier != UINT64_C(0) && iters < NODE_REACH_MAX_V) {
+        uint64_t next_all = UINT64_C(0);
+        uint64_t scan = frontier;
+        for (uint32_t u = 0U; u < st->num_verts; ++u) {
+            if (((scan >> u) & UINT64_C(1)) != UINT64_C(0)) {
+                next_all |= st->adj[u];
+            }
+        }
+        uint64_t delta = next_all & (~visited);
+        visited |= delta;
+        frontier = delta;
+        iters++;
+    }
+    if (iters_out != NULL) {
+        *iters_out = iters;
+    }
+    return visited;
+}
+
+void node_dyn_tri_init(node_dyn_tri_t *st, uint32_t num_verts) {
+    if (st == NULL) {
+        return;
+    }
+    node_zero_bytes(st, sizeof(*st));
+    st->num_verts = (num_verts > NODE_REACH_MAX_V) ? NODE_REACH_MAX_V : num_verts;
+}
+
+uint64_t node_dyn_tri_apply_edge(node_dyn_tri_t *st, uint32_t u, uint32_t v, int32_t delta_pm1) {
+    if (st == NULL || u >= st->num_verts || v >= st->num_verts || u >= NODE_REACH_MAX_V ||
+        v >= NODE_REACH_MAX_V || u == v) {
+        return (st != NULL) ? st->triangles : UINT64_C(0);
+    }
+    uint64_t mu = UINT64_C(1) << u;
+    uint64_t mv = UINT64_C(1) << v;
+    if (delta_pm1 > 0) {
+        if ((st->adj[u] & mv) == UINT64_C(0)) {
+            uint64_t added = node_popcount_u64(st->adj[u] & st->adj[v]);
+            st->adj[u] |= mv;
+            st->adj[v] |= mu;
+            st->triangles += added;
+            st->edge_ops++;
+        }
+    } else if (delta_pm1 < 0) {
+        if ((st->adj[u] & mv) != UINT64_C(0)) {
+            st->adj[u] &= ~mv;
+            st->adj[v] &= ~mu;
+            uint64_t lost = node_popcount_u64(st->adj[u] & st->adj[v]);
+            if (st->triangles >= lost) {
+                st->triangles -= lost;
+            } else {
+                st->triangles = UINT64_C(0);
+            }
+            st->edge_ops++;
+        }
+    }
+    return st->triangles;
+}

@@ -122,7 +122,7 @@ def _parse_llvm_functions_clang23(ir_text: str) -> Dict[str, Tuple[List[Tuple[st
 
 def run_llvm_ct_track(auditor_dir: Path, clang_bin: str) -> Dict[str, object]:
     sys.path.insert(0, str(auditor_dir / "crypto"))
-    from ct_llvm_audit import analyze_function  # type: ignore
+    from ct_llvm_audit import analyze_function, parse_functions  # type: ignore
 
     ll_out = BUILD / "node_ring0.ll"
     subprocess.run(
@@ -149,7 +149,7 @@ def run_llvm_ct_track(auditor_dir: Path, clang_bin: str) -> Dict[str, object]:
         check=True,
     )
     ir_text = ll_out.read_text(encoding="utf-8")
-    functions = _parse_llvm_functions_clang23(ir_text)
+    functions = parse_functions(ir_text)
 
     ct_targets = [
         "node_ct_eq32",
@@ -158,13 +158,14 @@ def run_llvm_ct_track(auditor_dir: Path, clang_bin: str) -> Dict[str, object]:
         "node_ct_cswap32",
         "node_net_msg_mac",
         "node_net_msg_verify",
+        "node_session_derive_key",
     ]
     verified_results = []
     for fn in ct_targets:
         assert fn in functions, f"Missing @{fn} in {ll_out}"
         params, body = functions[fn]
         assert len(params) >= 2, f"Parameter parse empty for {fn}: {params}"
-        res = analyze_function(fn, params, body)
+        res = analyze_function(fn, params, body, functions=functions)
         assert res["status"] == "CONSTANT_TIME_VERIFIED", f"CT violation in {fn}: {res}"
         verified_results.append(res)
         print(f"  [CT PATCHED]  {fn:<24} -> {res['status']} ({res['instruction_count']} IR insts)")
@@ -445,6 +446,26 @@ def main() -> int:
     assert mac_rep["genuine_ok"] is True and mac_rep["tamper_rejected"] == mac_rep["tamper_tests"] == 10, mac_rep
     print(f"  [NET MAC]     genuine_ok=True tamper_rejected={mac_rep['tamper_rejected']}/{mac_rep['tamper_tests']}")
 
+    llvm_z3_script = auditor_dir / "crypto" / "llvm_to_z3.py"
+    llvm_z3_rep = None
+    if llvm_z3_script.exists():
+        rep_p = BUILD / "node_llvm_z3_report.json"
+        subprocess.run(
+            [sys.executable, "-u", str(llvm_z3_script), "--extra-ll", str(ct_report["ir_file"]), "--report", str(rep_p)],
+            check=True,
+        )
+        llvm_z3_rep = json.loads(rep_p.read_text(encoding="utf-8"))
+
+    proto_script = auditor_dir / "verifier" / "protocol_verify.py"
+    proto_rep = None
+    if proto_script.exists():
+        prep_p = BUILD / "node_protocol_audit_report.json"
+        subprocess.run(
+            [sys.executable, "-u", str(proto_script), "--report", str(prep_p)],
+            check=True,
+        )
+        proto_rep = json.loads(prep_p.read_text(encoding="utf-8"))
+
     total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     report = {
         "auditor_dir": str(auditor_dir),
@@ -453,9 +474,15 @@ def main() -> int:
         "ct_audit": ct_report,
         "z3_qf_bv_pairs": z3_pairs,
         "net_mac_replay": mac_rep,
+        "llvm_to_z3": llvm_z3_rep,
+        "protocol_dolev_yao": proto_rep,
     }
     (BUILD / "node_auditor_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"[Gate 8] PASS ({len(ct_report['verified'])}/6 CT verified, {len(z3_pairs)}/6 Z3 QF_BV pairs UNSAT/SAT+replay, 10/10 Net MAC tamper rejected in {total_ms:.2f}ms)")
+    print(
+        f"[Gate 8] PASS ({len(ct_report['verified'])}/{len(ct_report['verified'])} CT verified, "
+        f"{len(z3_pairs)}/6 Z3 QF_BV pairs UNSAT/SAT+replay, 10/10 Net MAC tamper rejected"
+        f"{', LLVM-to-Z3 + 3/3 Dolev-Yao verified' if proto_rep else ''} in {total_ms:.2f}ms)"
+    )
     return 0
 
 

@@ -46,6 +46,8 @@ def main() -> int:
     dst_buggy = run_json(
         ["dst", "--universes", "128", "--ticks", "128", "--seed", "0x20261123", "--buggy"]
     )
+    udp = run_json(["udp-loopback", "512"])
+    disk = run_json(["disk-compact", "/tmp/node_bench_wal"])
 
     inc_reduction = dbsp["full_join_ops"] / max(1, dbsp["dbsp_inc_ops"])
     wcoj_reduction = (dbsp["binjoin_wedges"] + dbsp["binjoin_probes"]) / max(1, dbsp["wcoj_probes"])
@@ -59,12 +61,15 @@ def main() -> int:
     print(f"[Layer 2 WAL]  cuts={wal['atomic_ok']}/{wal['cuts_tested']} (100.0% atomic) torn_rejected={wal['torn_rejected']}/{wal['wal_len']} merkle_bitrot_caught={wal['bitrot_caught']}")
     print(f"[Layer 3 DST Clean] universes={dst_clean['universes']} ticks={dst_clean['ticks_total']} faults={dst_clean['faults_injected']} commits={dst_clean['commits']} crdt_conv={dst_clean['crdt_converged']}/{dst_clean['universes']} viol={dst_clean['violations_found']} ({t_clean*1000:.2f}ms)")
     print(f"[Layer 3 DST Buggy] universes={dst_buggy['universes']} viol={dst_buggy['violations_found']} min_witness_tick={dst_buggy['min_witness_tick']} witness_universe={dst_buggy['witness_universe']}")
+    print(f"[Layer 3 UDP Net]   port={udp['port']} frames={udp['recv_ok']}/{udp['sent_ok']} replay_rejected={udp['replay_rejected']} tamper_rejected={udp['tamper_rejected']} ({udp['elapsed_us']} us)")
+    print(f"[Layer 2 Disk WAL]  recs={disk['recovered_records']}/{disk['records_written']} segs={disk['segments_written']} torn_rejected={disk['torn_rejected']} codec={disk['codec']} ({disk['raw_snap_bytes']}B -> {disk['compressed_snap_bytes']}B, exact={disk['roundtrip_exact']})")
 
     assert vm["replay_exact"] and vm["escalation_blocked"]
     assert dbsp["dbsp_exact_match"] and dbsp["wcoj_triangles"] == dbsp["binjoin_triangles"]
     assert wal["atomic_ok"] == wal["cuts_tested"] and wal["bitrot_caught"]
     assert dst_clean["violations_found"] == 0 and dst_clean["crdt_converged"] == 128
     assert dst_buggy["violations_found"] > 0
+    assert udp["passed"] and disk["passed"] and disk["roundtrip_exact"]
 
     bloom_exe = BLOOM_BIN if BLOOM_BIN.exists() else (BLOOM_BIN_ALT if BLOOM_BIN_ALT.exists() else None)
     if bloom_exe is not None:
@@ -119,6 +124,19 @@ def main() -> int:
         )
         fline = [ln for ln in pf.stdout.splitlines() if "[BLOOM GPU" in ln]
         print(f"  {'bft_quorum_safety (FAULTSIM)':<28} -> {fline[-1] if fline else pf.stdout.strip()}")
+
+        for label, extra in [("node_dst SAFE 16K x 128", []), ("node_dst BUGGY 16K x 128", ["--buggy"])]:
+            pdst = subprocess.run(
+                [str(bloom_exe), "--node-dst", "--universes", "16384", "--ticks", "128", *extra],
+                cwd=str(bloom_dir),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            dline = [ln for ln in pdst.stdout.splitlines() if "[BLOOM GPU-NODE-DST]" in ln]
+            out_dst = dline[-1] if dline else pdst.stdout.strip()
+            print(f"  {label:<28} -> {out_dst}")
+            assert "cpu_verified=EXACT" in out_dst, out_dst
     else:
         print("[GPU Audit] BLOOM binary not found locally (skipping optional GPU cross-audit).")
 

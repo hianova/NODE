@@ -1,7 +1,14 @@
 SHELL := /bin/sh
 UNAME_S := $(shell uname -s)
 FLOW_DIR ?= ../FLOW
+INFO_DIR ?= ../INFO
 BUILD := build
+INFO_LIB := $(wildcard $(INFO_DIR)/build/libinfo.a)
+ifneq ($(INFO_LIB),)
+INFO_HOST_FLAGS := -isystem $(INFO_DIR)/include -isystem $(INFO_DIR)/build -DNODE_HAVE_INFO_CODEC=1
+else
+INFO_HOST_FLAGS :=
+endif
 LEAN ?= $(or $(shell command -v lean 2>/dev/null),$(HOME)/.elan/bin/lean)
 LEANCHECKER ?= $(or $(shell command -v leanchecker 2>/dev/null),$(HOME)/.elan/bin/leanchecker)
 AR ?= ar
@@ -39,9 +46,9 @@ C17_RING0_FLAGS := -std=c17 -O2 -ffreestanding -nostdlib -fno-builtin -fno-stack
 C17_HOST_FLAGS := -std=c17 -O2 -ffunction-sections -fdata-sections \
 	-Wall -Wextra -Werror -Wpedantic -Wconversion -Wundef -Wmissing-prototypes
 INC_RING0 := -Iinclude -I$(BUILD) -isystem $(FLOW_DIR)/core -isystem $(FLOW_DIR)/sdk
-INC_HOST := -Iinclude -I$(BUILD) -isystem $(FLOW_DIR)/core -isystem $(FLOW_DIR)/sdk
+INC_HOST := -Iinclude -I$(BUILD) -isystem $(FLOW_DIR)/core -isystem $(FLOW_DIR)/sdk $(INFO_HOST_FLAGS)
 
-C_SOURCES := include/node.h src/node_ring0.c src/node_cert.h src/node_cli.c
+C_SOURCES := include/node.h src/node_ring0.c src/node_cert.h src/node_net_udp.h src/node_disk_wal.h src/node_cli.c
 
 .PHONY: all clean fmt verify-all verify experiments \
 	gate0-lean-theory gate1-lean-schema gate2-ring0-audit gate3-selftest \
@@ -88,8 +95,8 @@ $(BUILD)/node_ring0.o: src/node_ring0.c include/node.h $(BUILD)/node_schema_abi.
 $(BUILD)/libnode.a: $(BUILD)/node_ring0.o
 	$(AR) rcs $@ $<
 
-$(BUILD)/node: $(BUILD)/node_ring0.o src/node_cli.c src/node_cert.h include/node.h $(BUILD)/node_schema_abi.h
-	$(CC) $(C17_HOST_FLAGS) $(INC_HOST) $(LDFLAGS_STRIP) $(BUILD)/node_ring0.o src/node_cli.c -o $@
+$(BUILD)/node: $(BUILD)/node_ring0.o src/node_cli.c src/node_cert.h src/node_net_udp.h src/node_disk_wal.h include/node.h $(BUILD)/node_schema_abi.h $(INFO_LIB)
+	$(CC) $(C17_HOST_FLAGS) $(INC_HOST) $(LDFLAGS_STRIP) $(BUILD)/node_ring0.o src/node_cli.c $(INFO_LIB) -o $@
 
 gate0-lean-theory: $(BUILD)/lean/Node/Theory.olean
 	@echo "[Gate 0] Checking 4 pure-theory pillars via leanchecker and axiom audit..."
@@ -99,12 +106,12 @@ gate0-lean-theory: $(BUILD)/lean/Node/Theory.olean
 	@for m in Node.Sandbox Node.Dbsp Node.Consensus Node.Dst Node.Theory; do \
 		LEAN_PATH=$(BUILD)/lean $(LEANCHECKER) $$m || exit 1; \
 	done
-	@python3 -c 'import pathlib, re; mods=[("Node.Sandbox","Node/Sandbox.lean"),("Node.Dbsp","Node/Dbsp.lean"),("Node.Consensus","Node/Consensus.lean"),("Node.Dst","Node/Dst.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==76, f"Expected 76 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/node_axioms.in").write_text("import Node.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
+	@python3 -c 'import pathlib, re; mods=[("Node.Sandbox","Node/Sandbox.lean"),("Node.Dbsp","Node/Dbsp.lean"),("Node.Consensus","Node/Consensus.lean"),("Node.Dst","Node/Dst.lean")]; thms=[f"#print axioms {m}.{n}" for m,p in mods for n in re.findall(r"^theorem\s+(\S+)", pathlib.Path(p).read_text(encoding="utf-8"), re.M)]; assert len(thms)==84, f"Expected 84 theorems, got {len(thms)}"; pathlib.Path("$(BUILD)/node_axioms.in").write_text("import Node.Theory\n" + "\n".join(thms) + "\n", encoding="utf-8")'
 	@LEAN_PATH=$(BUILD)/lean $(LEAN) --stdin < $(BUILD)/node_axioms.in > $(BUILD)/node_axioms.txt
 	@if grep -qE 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler' $(BUILD)/node_axioms.txt; then \
 		echo "ERROR: forbidden axiom detected"; exit 1; \
 	fi
-	@echo "[Gate 0] PASS (Node.Theory 76 theorems, 0 sorryAx, 0 ofReduceBool, 0 trustCompiler)"
+	@echo "[Gate 0] PASS (Node.Theory 84 theorems, 0 sorryAx, 0 ofReduceBool, 0 trustCompiler)"
 
 gate1-lean-schema: $(BUILD)/node_schema_abi.h
 	@echo "[Gate 1] Auditing Node.lean pure schema config and generated ABI header..."
@@ -135,7 +142,7 @@ endif
 	@echo "[Gate 2] PASS (0 undef symbols, Pure-GPR clean, C++20 clean, clang-tidy 0 warnings)"
 
 gate3-selftest: $(BUILD)/node
-	@echo "[Gate 3] Running built-in 15-suite Ring-0 + cert selftest..."
+	@echo "[Gate 3] Running built-in 18-suite Ring-0 + cert + UDP/Disk selftest..."
 	./$(BUILD)/node selftest
 	@echo "[Gate 3] PASS"
 

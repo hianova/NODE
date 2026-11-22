@@ -340,4 +340,53 @@ theorem two_generals_no_finite_protocol (k : Nat)
         exact ⟨ha, hb⟩
   exact hAll k (Nat.le_refl k)
 
+/-! ## Anti-Replay 64-Slot Sliding Window Verification -/
+
+structure ReplayWin where
+  maxSeq : Nat
+  seen : Nat → Bool
+  initialized : Bool
+
+def replayAccept (w : ReplayWin) (seq : Nat) : Bool :=
+  if !w.initialized then true
+  else if w.maxSeq < seq then true
+  else if w.maxSeq - seq < 64 then !(w.seen seq)
+  else false
+
+def replayUpdate (w : ReplayWin) (seq : Nat) : ReplayWin :=
+  if !w.initialized then
+    { maxSeq := seq, seen := fun s => s == seq, initialized := true }
+  else if w.maxSeq < seq then
+    { maxSeq := seq
+    , seen := fun s => (s == seq) || (w.seen s)
+    , initialized := true }
+  else
+    { w with seen := fun s => (s == seq) || (w.seen s) }
+
+theorem replay_window_rejects_old (w : ReplayWin) (seq : Nat)
+    (hInit : w.initialized = true) (hOld : seq + 64 ≤ w.maxSeq) :
+    replayAccept w seq = false := by
+  unfold replayAccept
+  simp [hInit]
+  omega
+
+theorem replay_window_accepts_advance (w : ReplayWin) (seq : Nat)
+    (hInit : w.initialized = true) (hAdv : w.maxSeq < seq) :
+    replayAccept w seq = true := by
+  unfold replayAccept
+  simp [hInit, hAdv]
+
+theorem replay_window_marks_seen (w : ReplayWin) (seq : Nat) :
+    (replayUpdate w seq).seen seq = true := by
+  unfold replayUpdate
+  split
+  · simp
+  · split <;> simp
+
+theorem replay_window_no_duplicate (w : ReplayWin) (seq : Nat)
+    (hInit : w.initialized = true) (hLe : seq ≤ w.maxSeq) (hSeen : w.seen seq = true) :
+    replayAccept w seq = false := by
+  unfold replayAccept
+  simp [hInit, hLe, hSeen]
+
 end Node.Consensus

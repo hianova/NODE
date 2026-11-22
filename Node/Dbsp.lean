@@ -258,4 +258,66 @@ theorem merkle_pair_tamper_detection (hPair : Nat → Nat → Nat)
   | inl h => exact h hl
   | inr h => exact h hr
 
+/-! ## Semi-Naive Recursive DBSP Reachability Fixed-Point Theorems -/
+
+def hasPredIn (adj : Nat → Nat → Bool) (r : Nat → Bool) : Nat → Nat → Bool
+  | 0, _ => false
+  | m + 1, v => (r m && adj m v) || hasPredIn adj r m v
+
+def reachStep (adj : Nat → Nat → Bool) (n : Nat) (r : Nat → Bool) (v : Nat) : Bool :=
+  r v || hasPredIn adj r n v
+
+def reachIter (adj : Nat → Nat → Bool) (n : Nat) (seed : Nat → Bool) : Nat → (Nat → Bool)
+  | 0 => seed
+  | k + 1 => reachStep adj n (reachIter adj n seed k)
+
+theorem reachStep_monotone (adj : Nat → Nat → Bool) (n : Nat) (r1 r2 : Nat → Bool)
+    (hSub : ∀ u, r1 u = true → r2 u = true) :
+    ∀ v, reachStep adj n r1 v = true → reachStep adj n r2 v = true := by
+  have hPred : ∀ m v, hasPredIn adj r1 m v = true → hasPredIn adj r2 m v = true := by
+    intro m v
+    induction m with
+    | zero => intro h; simp [hasPredIn] at h
+    | succ m ih =>
+        intro h
+        simp [hasPredIn, Bool.or_eq_true, Bool.and_eq_true] at h ⊢
+        cases h with
+        | inl hm => exact Or.inl ⟨hSub m hm.1, hm.2⟩
+        | inr hr => exact Or.inr (ih hr)
+  intro v hv
+  simp [reachStep, Bool.or_eq_true] at hv ⊢
+  cases hv with
+  | inl hr => exact Or.inl (hSub v hr)
+  | inr hp => exact Or.inr (hPred n v hp)
+
+theorem reachIter_monotone (adj : Nat → Nat → Bool) (n : Nat) (seed : Nat → Bool)
+    {k1 k2 : Nat} (hLe : k1 ≤ k2) :
+    ∀ v, reachIter adj n seed k1 v = true → reachIter adj n seed k2 v = true := by
+  induction k2 with
+  | zero =>
+      have hk : k1 = 0 := Nat.le_zero.mp hLe
+      subst hk
+      intro v hv
+      exact hv
+  | succ k2 ih =>
+      intro v hv
+      rcases Nat.lt_or_eq_of_le hLe with hLt | rfl
+      · have hStep := ih (Nat.le_of_lt_succ hLt) v hv
+        simp [reachIter, reachStep, hStep]
+      · exact hv
+
+theorem reachIter_extensive (adj : Nat → Nat → Bool) (n : Nat) (seed : Nat → Bool) (k : Nat) :
+    ∀ v, seed v = true → reachIter adj n seed k v = true :=
+  reachIter_monotone adj n seed (Nat.zero_le k)
+
+theorem reach_fixpoint_stable (adj : Nat → Nat → Bool) (n : Nat) (r : Nat → Bool)
+    (hFix : reachStep adj n r = r) :
+    ∀ k, reachIter adj n r k = r := by
+  intro k
+  induction k with
+  | zero => rfl
+  | succ k ih =>
+      dsimp [reachIter]
+      rw [ih, hFix]
+
 end Node.Dbsp
