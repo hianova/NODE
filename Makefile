@@ -45,7 +45,7 @@ C_SOURCES := include/node.h src/node_ring0.c src/node_cert.h src/node_cli.c
 
 .PHONY: all clean fmt verify-all verify experiments \
 	gate0-lean-theory gate1-lean-schema gate2-ring0-audit gate3-selftest \
-	gate4-cli-audit gate5-oracle gate6-sabotage gate7-format
+	gate4-cli-audit gate5-oracle gate6-sabotage gate7-format gate8-auditor
 
 all: $(BUILD)/libnode.a $(BUILD)/node
 
@@ -166,15 +166,19 @@ gate7-format:
 	$(CLANG_FORMAT) --dry-run --Werror $(C_SOURCES)
 	@echo "[Gate 7] PASS"
 
+gate8-auditor: $(BUILD)/node $(BUILD)/node_ring0.o
+	@echo "[Gate 8] Running ../Auditor LLVM IR CT + Z3 QF_BV + Net MAC replay audit..."
+	CC=$(CC) python3 tools/node_auditor_check.py
+
 experiments: $(BUILD)/node
 	@echo "[Experiments] Running Layer 1-3 Trinity Benchmarks & BLOOM GPU Witness Verification..."
 	python3 experiments/node_trinity_benchmark.py
 	@echo "[Experiments] PASS"
 
 verify-all: gate0-lean-theory gate1-lean-schema gate2-ring0-audit gate3-selftest \
-	gate4-cli-audit gate5-oracle gate6-sabotage gate7-format
+	gate4-cli-audit gate5-oracle gate6-sabotage gate7-format gate8-auditor
 	@echo "================================================================"
-	@echo "NODE v1.0.0 — ALL 8 VERIFICATION GATES PASSED"
+	@echo "NODE v1.0.0 — ALL 9 VERIFICATION GATES PASSED"
 	@echo "================================================================"
 
 verify: verify-all

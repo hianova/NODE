@@ -49,13 +49,15 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M02_cap_drop_lower_bound",
             "vm_caps",
-            "    if (addr < c->base || addr >= c->base + c->len || addr >= NODE_VM_MEM_WORDS) {",
+            "    if (c->base > NODE_VM_MEM_WORDS || c->len > NODE_VM_MEM_WORDS - c->base || addr < c->base ||\n"
+            "        (addr - c->base) >= c->len || addr >= NODE_VM_MEM_WORDS) {",
             "    if (addr >= c->base + c->len || addr >= NODE_VM_MEM_WORDS) {",
         ),
         NodeMutant(
             "M03_cap_drop_upper_bound",
             "vm_caps",
-            "    if (addr < c->base || addr >= c->base + c->len || addr >= NODE_VM_MEM_WORDS) {\n"
+            "    if (c->base > NODE_VM_MEM_WORDS || c->len > NODE_VM_MEM_WORDS - c->base || addr < c->base ||\n"
+            "        (addr - c->base) >= c->len || addr >= NODE_VM_MEM_WORDS) {\n"
             "        return false;\n"
             "    }\n"
             "    return true;",
@@ -80,9 +82,9 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M06_att_skip_bounds_check",
             "vm_attenuate",
-            "    if (new_base < src.base || new_len > src.len || new_base > src.base + src.len ||\n"
-            "        new_base + new_len > src.base + src.len) {",
-            "    if (false && (new_base < src.base || new_len > src.len)) {",
+            "    if (new_base < src.base || new_base > src.base + src.len ||\n"
+            "        new_len > (src.base + src.len) - new_base) {",
+            "    if (false && new_base < src.base && new_len > src.len) {",
         ),
         # --- 3. vm_fuel_replay (3) ---
         NodeMutant(
@@ -119,15 +121,29 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M10_zset_keep_zero_weight",
             "zset_abelian",
-            "        int64_t nw = z->entries[lo].weight + weight;\n        if (nw == INT64_C(0)) {",
-            "        int64_t nw = z->entries[lo].weight + weight;\n        if (false && nw == INT64_C(0)) {",
+            "        int64_t nw = z->entries[lo].weight + weight;\n"
+            "        if (!node_zset_weight_ok(nw)) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        if (nw == INT64_C(0)) {",
+            "        int64_t nw = z->entries[lo].weight + weight;\n"
+            "        if (!node_zset_weight_ok(nw)) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        if (false && nw == INT64_C(0)) {",
         ),
         NodeMutant(
             "M11_zset_combine_keep_zero",
             "zset_abelian",
             "            int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;\n"
+            "            if (!node_zset_weight_ok(w)) {\n"
+            "                return false;\n"
+            "            }\n"
             "            if (w != INT64_C(0)) {",
             "            int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;\n"
+            "            if (!node_zset_weight_ok(w)) {\n"
+            "                return false;\n"
+            "            }\n"
             "            if (true || w != INT64_C(0)) {",
         ),
         NodeMutant(
@@ -234,14 +250,11 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M21_merkle_drop_sibling_hash",
             "merkle_wal_chain",
-            "        if ((idx & 1U) == 0U) {\n"
-            "            node_hash_u64_pair(cur_hash, proof->siblings[lvl], next_hash);\n"
-            "        } else {\n"
-            "            node_hash_u64_pair(proof->siblings[lvl], cur_hash, next_hash);\n"
-            "        }",
-            "        (void)proof;\n"
-            "        (void)idx;\n"
-            "        node_hash_u64_pair(cur_hash, cur_hash, next_hash);",
+            "        node_ct_cswap32(left, right, idx & 1U);\n"
+            "        node_hash_u64_pair(left, right, next_hash);",
+            "        node_ct_cswap32(left, right, idx & 1U);\n"
+            "        (void)right;\n"
+            "        node_hash_u64_pair(left, left, next_hash);",
         ),
         # --- 8. wal_crash_recover (3) ---
         NodeMutant(
@@ -335,8 +348,8 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M31_bft_broken_quorum_2f",
             "bft_equivocation",
-            "    b->quorum = (broken_quorum != 0U) ? (2U * f) : (2U * f + 1U);",
-            "    b->quorum = 2U * f;",
+            "    if (broken_quorum != 0U) {\n        b->quorum = 2U * f;\n    } else if (b->n == 0U || f > 2U || (3U * f + 1U) > b->n) {\n        b->quorum = b->n + 1U;\n    } else {\n        b->quorum = 2U * f + 1U;\n    }",
+            "    (void)broken_quorum;\n    b->quorum = 2U * f;",
         ),
         NodeMutant(
             "M32_bft_skip_conflict_check",

@@ -75,6 +75,107 @@ static uint32_t node_wrap_small(uint32_t x, uint32_t n) {
     return x;
 }
 
+bool node_ct_eq32(const uint8_t a[32], const uint8_t b[32]) {
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    uint32_t diff = 0U;
+    for (size_t i = 0U; i < 32U; ++i) {
+        diff |= (uint32_t)(a[i] ^ b[i]);
+    }
+    return diff == 0U;
+}
+
+bool node_ct_eq_u64(uint64_t a, uint64_t b) {
+    uint64_t d = a ^ b;
+    return d == UINT64_C(0);
+}
+
+uint64_t node_ct_select_u64(uint64_t a, uint64_t b, uint32_t sel_bit) {
+    uint64_t m = UINT64_C(0) - (uint64_t)(sel_bit & 1U);
+    return (a & ~m) | (b & m);
+}
+
+void node_ct_cswap32(uint8_t a[32], uint8_t b[32], uint32_t swap_bit) {
+    if (a == NULL || b == NULL) {
+        return;
+    }
+    uint8_t m = (uint8_t)(0U - (swap_bit & 1U));
+    for (size_t i = 0U; i < 32U; ++i) {
+        uint8_t t = m & (uint8_t)(a[i] ^ b[i]);
+        a[i] ^= t;
+        b[i] ^= t;
+    }
+}
+
+static void node_write_le32_bytes(uint8_t dst[4], uint32_t v) {
+    dst[0] = (uint8_t)(v & 0xFFU);
+    dst[1] = (uint8_t)((v >> 8U) & 0xFFU);
+    dst[2] = (uint8_t)((v >> 16U) & 0xFFU);
+    dst[3] = (uint8_t)((v >> 24U) & 0xFFU);
+}
+
+void node_net_msg_mac(const uint8_t key[32], const node_net_msg_t *msg, uint8_t tag_out[32]) {
+    if (key == NULL || msg == NULL || tag_out == NULL) {
+        return;
+    }
+    uint8_t ser[40];
+    node_write_le32_bytes(ser + 0U, msg->kind);
+    node_write_le32_bytes(ser + 4U, msg->src);
+    node_write_le32_bytes(ser + 8U, msg->dst);
+    node_write_le32_bytes(ser + 12U, msg->term);
+    node_write_le32_bytes(ser + 16U, msg->index);
+    node_write_le32_bytes(ser + 20U, msg->prev_term);
+    node_write_le32_bytes(ser + 24U, msg->success);
+    node_write_le32_bytes(ser + 28U, msg->val);
+    node_write_le32_bytes(ser + 32U, msg->entry_term);
+    node_write_le32_bytes(ser + 36U, msg->leader_commit);
+
+    uint8_t blk0[64];
+    uint8_t blk1[64];
+    node_zero_bytes(blk1, sizeof(blk1));
+    blk0[0] = UINT8_C(0x4E);
+    for (size_t i = 0U; i < 32U; ++i) {
+        blk0[1U + i] = key[i];
+    }
+    for (size_t i = 0U; i < 31U; ++i) {
+        blk0[33U + i] = ser[i];
+    }
+    for (size_t i = 0U; i < 9U; ++i) {
+        blk1[i] = ser[31U + i];
+    }
+    for (size_t i = 0U; i < 32U; ++i) {
+        blk1[9U + i] = key[i];
+    }
+    blk1[41] = UINT8_C(0x80);
+    blk1[62] = UINT8_C(0x03);
+    blk1[63] = UINT8_C(0x48); /* 105 bytes = 840 bits */
+
+    flow_sha256_ctx_t ctx;
+    node_zero_bytes(&ctx, sizeof(ctx));
+    flow_sha256_init(&ctx);
+    flow_sha256__transform(&ctx, blk0);
+    flow_sha256__transform(&ctx, blk1);
+    for (size_t i = 0U; i < 8U; ++i) {
+        uint32_t s = ctx.state[i];
+        size_t o = i * 4U;
+        tag_out[o + 0U] = (uint8_t)((s >> 24U) & 0xFFU);
+        tag_out[o + 1U] = (uint8_t)((s >> 16U) & 0xFFU);
+        tag_out[o + 2U] = (uint8_t)((s >> 8U) & 0xFFU);
+        tag_out[o + 3U] = (uint8_t)(s & 0xFFU);
+    }
+}
+
+bool node_net_msg_verify(const uint8_t key[32], const node_net_msg_t *msg, const uint8_t tag[32]) {
+    if (key == NULL || msg == NULL || tag == NULL) {
+        return false;
+    }
+    uint8_t expect[32];
+    node_zero_bytes(expect, sizeof(expect));
+    node_net_msg_mac(key, msg, expect);
+    return node_ct_eq32(expect, tag);
+}
+
 uint64_t node_prng_next(uint64_t *state) {
     uint64_t x = (state != NULL) ? *state : UINT64_C(0x9E3779B97F4A7C15);
     if (x == UINT64_C(0)) {
@@ -127,8 +228,11 @@ bool node_vm_attenuate_cap(node_vm_t *vm, uint32_t dst_slot, uint32_t src_slot, 
     if ((new_rights & src.rights) != new_rights) {
         return false;
     }
-    if (new_base < src.base || new_len > src.len || new_base > src.base + src.len ||
-        new_base + new_len > src.base + src.len) {
+    if (src.base > NODE_VM_MEM_WORDS || src.len > NODE_VM_MEM_WORDS - src.base) {
+        return false;
+    }
+    if (new_base < src.base || new_base > src.base + src.len ||
+        new_len > (src.base + src.len) - new_base) {
         return false;
     }
     vm->state.caps[dst_slot].region_id = src.region_id;
@@ -142,7 +246,8 @@ static bool vm_check_cap(const node_cap_t *c, uint32_t addr, uint32_t req_right)
     if (c == NULL || (c->rights & req_right) != req_right) {
         return false;
     }
-    if (addr < c->base || addr >= c->base + c->len || addr >= NODE_VM_MEM_WORDS) {
+    if (c->base > NODE_VM_MEM_WORDS || c->len > NODE_VM_MEM_WORDS - c->base || addr < c->base ||
+        (addr - c->base) >= c->len || addr >= NODE_VM_MEM_WORDS) {
         return false;
     }
     return true;
@@ -292,6 +397,10 @@ uint64_t node_vm_state_hash(const node_vm_t *vm) {
  * LAYER 2: DBSP Z-Sets, WCOJ Triangle Join & Merkle Crash-Safe WAL
  * ============================================================================ */
 
+static bool node_zset_weight_ok(int64_t w) {
+    return w >= -NODE_ZSET_MAX_WEIGHT && w <= NODE_ZSET_MAX_WEIGHT;
+}
+
 void node_zset_init(node_zset_t *z) {
     if (z == NULL) {
         return;
@@ -306,6 +415,9 @@ bool node_zset_add_entry(node_zset_t *z, uint64_t key, int64_t weight) {
     if (weight == INT64_C(0)) {
         return true;
     }
+    if (!node_zset_weight_ok(weight)) {
+        return false;
+    }
     uint32_t lo = 0U;
     uint32_t hi = z->len;
     while (lo < hi) {
@@ -317,7 +429,13 @@ bool node_zset_add_entry(node_zset_t *z, uint64_t key, int64_t weight) {
         }
     }
     if (lo < z->len && z->entries[lo].key == key) {
+        if (!node_zset_weight_ok(z->entries[lo].weight)) {
+            return false;
+        }
         int64_t nw = z->entries[lo].weight + weight;
+        if (!node_zset_weight_ok(nw)) {
+            return false;
+        }
         if (nw == INT64_C(0)) {
             for (uint32_t k = lo; k + 1U < z->len; ++k) {
                 z->entries[k].key = z->entries[k + 1U].key;
@@ -370,7 +488,14 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
             out->len++;
             j++;
         } else {
+            if (!node_zset_weight_ok(a->entries[i].weight) ||
+                !node_zset_weight_ok(b->entries[j].weight)) {
+                return false;
+            }
             int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;
+            if (!node_zset_weight_ok(w)) {
+                return false;
+            }
             if (w != INT64_C(0)) {
                 if (out->len >= NODE_ZSET_CAP) {
                     return false;
@@ -384,7 +509,7 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
         }
     }
     while (i < a->len) {
-        if (out->len >= NODE_ZSET_CAP) {
+        if (out->len >= NODE_ZSET_CAP || !node_zset_weight_ok(a->entries[i].weight)) {
             return false;
         }
         out->entries[out->len].key = a->entries[i].key;
@@ -393,7 +518,7 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
         i++;
     }
     while (j < b->len) {
-        if (out->len >= NODE_ZSET_CAP) {
+        if (out->len >= NODE_ZSET_CAP || !node_zset_weight_ok(b->entries[j].weight)) {
             return false;
         }
         out->entries[out->len].key = b->entries[j].key;
@@ -462,7 +587,13 @@ bool node_zset_join(const node_zset_t *a, const node_zset_t *b, node_zset_t *out
         for (uint32_t i = 0U; i < a->len; ++i) {
             int64_t wb = 0;
             if (zset_bsearch(b, a->entries[i].key, &wb, &ops)) {
+                if (!node_zset_weight_ok(a->entries[i].weight) || !node_zset_weight_ok(wb)) {
+                    return false;
+                }
                 int64_t pw = a->entries[i].weight * wb;
+                if (!node_zset_weight_ok(pw)) {
+                    return false;
+                }
                 if (pw != INT64_C(0)) {
                     out->entries[out->len].key = a->entries[i].key;
                     out->entries[out->len].weight = pw;
@@ -474,7 +605,13 @@ bool node_zset_join(const node_zset_t *a, const node_zset_t *b, node_zset_t *out
         for (uint32_t j = 0U; j < b->len; ++j) {
             int64_t wa = 0;
             if (zset_bsearch(a, b->entries[j].key, &wa, &ops)) {
+                if (!node_zset_weight_ok(wa) || !node_zset_weight_ok(b->entries[j].weight)) {
+                    return false;
+                }
                 int64_t pw = wa * b->entries[j].weight;
+                if (!node_zset_weight_ok(pw)) {
+                    return false;
+                }
                 if (pw != INT64_C(0)) {
                     out->entries[out->len].key = b->entries[j].key;
                     out->entries[out->len].weight = pw;
@@ -492,7 +629,14 @@ bool node_zset_join(const node_zset_t *a, const node_zset_t *b, node_zset_t *out
             } else if (b->entries[j].key < a->entries[i].key) {
                 j++;
             } else {
+                if (!node_zset_weight_ok(a->entries[i].weight) ||
+                    !node_zset_weight_ok(b->entries[j].weight)) {
+                    return false;
+                }
                 int64_t pw = a->entries[i].weight * b->entries[j].weight;
+                if (!node_zset_weight_ok(pw)) {
+                    return false;
+                }
                 if (pw != INT64_C(0)) {
                     out->entries[out->len].key = a->entries[i].key;
                     out->entries[out->len].weight = pw;
@@ -895,20 +1039,16 @@ bool node_merkle_verify_proof64(const node_merkle_proof_t *proof, const uint8_t 
     node_hash_u64_leaf(proof->leaf_idx, proof->leaf_val, cur_hash);
     uint32_t idx = proof->leaf_idx;
     for (uint32_t lvl = 0U; lvl < 6U; ++lvl) {
-        if ((idx & 1U) == 0U) {
-            node_hash_u64_pair(cur_hash, proof->siblings[lvl], next_hash);
-        } else {
-            node_hash_u64_pair(proof->siblings[lvl], cur_hash, next_hash);
-        }
+        uint8_t left[32];
+        uint8_t right[32];
+        node_copy_bytes(left, cur_hash, 32U);
+        node_copy_bytes(right, proof->siblings[lvl], 32U);
+        node_ct_cswap32(left, right, idx & 1U);
+        node_hash_u64_pair(left, right, next_hash);
         node_copy_bytes(cur_hash, next_hash, 32U);
         idx >>= 1U;
     }
-    for (uint32_t b = 0U; b < 32U; ++b) {
-        if (cur_hash[b] != root[b]) {
-            return false;
-        }
-    }
-    return true;
+    return node_ct_eq32(cur_hash, root);
 }
 
 uint32_t node_wal_recover(const node_wal_t *w, uint32_t prefix_len, uint32_t corrupt_idx,
@@ -1136,7 +1276,8 @@ static void raft_send_msg(node_raft_cluster_t *r, uint32_t kind, uint32_t src, u
             r->net[i].val = val;
             r->net[i].entry_term = entry_term;
             r->net[i].leader_commit = leader_commit;
-            r->net[i].deliver_tick = r->tick + delay;
+            r->net[i].deliver_tick =
+                (delay > UINT32_MAX - r->tick) ? UINT32_MAX : (r->tick + delay);
             return;
         }
     }
@@ -1210,7 +1351,7 @@ void node_raft_tick(node_raft_cluster_t *r, uint32_t cmd_if_leader) {
         node_copy_bytes(&m, &r->net[i], sizeof(m));
         r->net[i].valid = 0U;
 
-        if (m.dst >= NODE_RAFT_N || m.src >= NODE_RAFT_N) {
+        if (m.dst >= NODE_RAFT_N || m.src >= NODE_RAFT_N || m.src == m.dst || m.term == 0U) {
             continue;
         }
         if (r->crashed[m.dst] != 0U || r->partition_group[m.src] != r->partition_group[m.dst]) {
@@ -1351,7 +1492,9 @@ void node_raft_tick(node_raft_cluster_t *r, uint32_t cmd_if_leader) {
                 r->election_timer[i]--;
             }
             if (r->election_timer[i] == 0U) {
-                r->current_term[i]++;
+                if (r->current_term[i] < UINT32_MAX) {
+                    r->current_term[i]++;
+                }
                 r->role[i] = RAFT_ROLE_CANDIDATE;
                 r->voted_for[i] = i;
                 r->votes_got[i] = (UINT32_C(1) << i);
@@ -1382,7 +1525,13 @@ void node_bft_init(node_bft_cluster_t *b, uint32_t n, uint32_t f, uint32_t byz_m
     b->n = (n > NODE_BFT_MAX_N) ? NODE_BFT_MAX_N : n;
     b->f = f;
     b->broken_quorum = broken_quorum;
-    b->quorum = (broken_quorum != 0U) ? (2U * f) : (2U * f + 1U);
+    if (broken_quorum != 0U) {
+        b->quorum = 2U * f;
+    } else if (b->n == 0U || f > 2U || (3U * f + 1U) > b->n) {
+        b->quorum = b->n + 1U;
+    } else {
+        b->quorum = 2U * f + 1U;
+    }
     b->byz_mask = byz_mask;
     b->first_violation_tick = UINT32_MAX;
     b->prng = (seed != UINT64_C(0)) ? seed : UINT64_C(0xBF73F001CAFEBABE);

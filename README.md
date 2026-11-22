@@ -1,6 +1,6 @@
 # NODE v1.0.0 — Certified Deterministic Systems Substrate
 
-**Pure Lean 4 Formal Systems Theory (`76` Kernel-Checked Theorems, `0 sorryAx`, `0 bv_decide`, `0 Lean.ofReduceBool`) + Freestanding Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` Ring-0 C17 Systems Core (`libnode.a`) + Zero-Heap Native CLI & Cert Emitter (`build/node`, `104,872 B`) + `256`-Slot `16,384 B` Zero-`memcpy` Schema ABI (`FLOW v9.0.0`) + `36 / 36` (`100.0%`) Single-Fault Sabotage Audit + Cross-Ecosystem Apple M1 GPU Verification via [`../BLOOM`](../BLOOM/README.md).**
+**Pure Lean 4 Formal Systems Theory (`76` Kernel-Checked Theorems, `0 sorryAx`, `0 bv_decide`, `0 Lean.ofReduceBool`) + Freestanding Pure-GPR / Zero-Float / Zero-Heap / Zero-`blr` Ring-0 C17 Systems Core (`libnode.a`) + Zero-Heap Native CLI & Cert Emitter (`build/node`, `105,064 B`) + `256`-Slot `16,384 B` Zero-`memcpy` Schema ABI (`FLOW v9.0.0`) + `36 / 36` (`100.0%`) Single-Fault Sabotage Audit + [`../Auditor`](../Auditor/README.md) LLVM IR (`-O2`) Constant-Time & Z3 `QF_BV` Security Audit (`6/6` CT + `6/6` Z3 Pairs + `10/10` Net MAC Tamper Rejected) + Cross-Ecosystem Apple M1 GPU Verification via [`../BLOOM`](../BLOOM/README.md).**
 
 ---
 
@@ -34,7 +34,7 @@
 
 ---
 
-## Verified 8-Gate Zero-Trust Audit
+## Verified 9-Gate Zero-Trust Audit
 
 | Gate | Target | Verified Result (`make verify-all`) |
 | :--- | :--- | :--- |
@@ -42,10 +42,11 @@
 | **Gate 1** | `Node.lean` Schema ABI | `256`-slot (`16,384 B`) `build/node_schema_abi.h`, `0 memcpy`, `leanchecker Node` PASS |
 | **Gate 2** | `src/node_ring0.c` (`libnode.a`) | `-ffreestanding -nostdlib -mgeneral-regs-only`: `0` undefined symbols (`nm -u`), `0` `udiv`/`sdiv`/float/SIMD/`blr`/`br` (`otool -tV`), C++20 `include/node.h` clean, `clang-tidy` `0` warnings |
 | **Gate 3** | `./build/node selftest` | `15 / 15` built-in Ring-0 & certificate suites PASS |
-| **Gate 4** | `build/node` Binary Audit | `104,872 B`, `0` `leanshared` linkage, `0` heap allocators (`malloc`/`free`/`calloc`/`realloc`) |
+| **Gate 4** | `build/node` Binary Audit | `105,064 B`, `0` `leanshared` linkage, `0` heap allocators (`malloc`/`free`/`calloc`/`realloc`) |
 | **Gate 5** | `oracles/verify_node_oracle.py` | Independent Python oracle PASS (VM replay, DBSP/WCOJ, `25/25` WAL cuts, DST reproducibility, `3/3` live Lean certs replayed) |
-| **Gate 6** | `tools/node_sabotage_check.py` | **`36 / 36` (`100.0%`)** single-fault mutants killed across 12 categories (`3/3` per category) in `6.56s` |
+| **Gate 6** | `tools/node_sabotage_check.py` | **`36 / 36` (`100.0%`)** single-fault mutants killed across 12 categories (`3/3` per category) in `5.72s` |
 | **Gate 7** | `clang-format` | `0` formatting violations across all `.h`/`.c` sources |
+| **Gate 8** | `tools/node_auditor_check.py` ([`../Auditor`](../Auditor/README.md)) | **`6/6` LLVM IR `-O2` `CONSTANT_TIME_VERIFIED`** (`node_ct_eq32`, `node_ct_eq_u64`, `node_ct_select_u64`, `node_ct_cswap32`, `node_net_msg_mac`, `node_net_msg_verify`), negative control `node_leaky_auth` flagged `SECRET_BRANCH`, **`6/6` Z3 `5.3.3` `QF_BV` pairs** (`buggy=sat` + C replay rejected, `patched=unsat`), **`10/10` Net MAC** bit-flip tampers rejected (`19,735.96ms`) |
 
 ---
 
@@ -56,15 +57,15 @@
 - **Layer 2 (DBSP Incremental Join)**: `epochs=20`, `exact=True`, `inc_ops=409` vs `full_ops=2560` (**`6.26x` work reduction**)
 - **Layer 2 (WCOJ Triangle Join)**: `triangles=32 == 32`, `wcoj_probes=329` vs `bin_wedges=780 + bin_probes=1717` (**`7.59x` work reduction**)
 - **Layer 2 (Merkle Crash-Safe WAL)**: `cuts=25/25` (**`100.0%` atomic**), `torn_rejected=24/24`, `merkle_bitrot_caught=True`
-- **Layer 3 (Multi-Universe DST, Clean Quorum)**: `universes=128`, `ticks=16,384`, `faults=4,624`, `commits=36,467`, `crdt_conv=128/128`, **`violations=0`** (`43.61ms`)
+- **Layer 3 (Multi-Universe DST, Clean Quorum)**: `universes=128`, `ticks=16,384`, `faults=4,624`, `commits=36,467`, `crdt_conv=128/128`, **`violations=0`** (`43.00ms`)
 - **Layer 3 (Multi-Universe DST, Broken Quorum `--buggy`)**: `universes=128`, **`violations=32,768`**, `min_witness_tick=1`, `witness_universe=0`
 
 ### Cross-Ecosystem Apple M1 GPU (`SDL3-GPU/metal`) Verification via `../BLOOM/build/bloom`
-- `cap_isolation.fir` (`16-bit`, `65,536` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.24ms` (`29.22 M_evals/s`), `cpu_parity=EXACT`
-- `bft_quorum_safety.fir` (`12-bit`, `4,096` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.09ms` (`1.96 M_evals/s`), `cpu_parity=EXACT`
-- `bft_quorum_buggy.fir` (`12-bit`, `4,096` exhaustive trials): **`hits=78`**, **`first_hit=FOUND`**, `time=2.21ms` (`1.85 M_evals/s`), `cpu_parity=EXACT`
-- `dbsp_join_delta.fir` (`16-bit`, `65,536` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.47ms` (`26.55 M_evals/s`), `cpu_parity=EXACT`
-- `bft_quorum_safety.fir` Stuck-at Fault Sim (`4,096` trials/fault): `wires=78`, `gates=64`, `faults=152`, `detected=63`, `total_evals=622,592`, `time=17.58ms` (`35.41 M_fevals/s`), `cpu_verified=EXACT`
+- `cap_isolation.fir` (`16-bit`, `65,536` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.08ms` (`31.54 M_evals/s`), `cpu_parity=EXACT`
+- `bft_quorum_safety.fir` (`12-bit`, `4,096` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.11ms` (`1.94 M_evals/s`), `cpu_parity=EXACT`
+- `bft_quorum_buggy.fir` (`12-bit`, `4,096` exhaustive trials): **`hits=78`**, **`first_hit=FOUND`**, `time=2.14ms` (`1.91 M_evals/s`), `cpu_parity=EXACT`
+- `dbsp_join_delta.fir` (`16-bit`, `65,536` exhaustive trials): `hits=0`, `first_hit=NONE`, `time=2.37ms` (`27.69 M_evals/s`), `cpu_parity=EXACT`
+- `bft_quorum_safety.fir` Stuck-at Fault Sim (`4,096` trials/fault): `wires=78`, `gates=64`, `faults=152`, `detected=63`, `total_evals=622,592`, `time=17.42ms` (`35.74 M_fevals/s`), `cpu_verified=EXACT`
 
 ---
 
@@ -80,5 +81,6 @@ make experiments
 ./build/node wal-audit
 ./build/node dst --universes 128 --ticks 128 --seed 0x20261123
 ./build/node dst --universes 128 --ticks 128 --seed 0x20261123 --buggy
+./build/node audit-replay net-mac
 ./build/node emit-certs build/certs
 ```

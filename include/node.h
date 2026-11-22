@@ -55,6 +55,7 @@ extern "C" {
 #define NODE_FAULT_OP        4U
 
 #define NODE_ZSET_CAP        256U
+#define NODE_ZSET_MAX_WEIGHT INT64_C(0x3FFFFFFF)
 #define NODE_WCOJ_MAX_VERTS  128U
 #define NODE_WCOJ_MAX_EDGES  1024U
 
@@ -358,6 +359,13 @@ void node_dst_run(const node_dst_cfg_t *cfg, node_dst_report_t *out, node_raft_c
 void node_arena_fill_summary(NodeArena *arena, const node_vm_t *vm,
                              const node_dbsp_join_state_t *dbsp, const node_wal_t *wal,
                              const node_dst_report_t *dst);
+
+bool node_ct_eq32(const uint8_t a[32], const uint8_t b[32]);
+bool node_ct_eq_u64(uint64_t a, uint64_t b);
+uint64_t node_ct_select_u64(uint64_t a, uint64_t b, uint32_t sel_bit);
+void node_ct_cswap32(uint8_t a[32], uint8_t b[32], uint32_t swap_bit);
+void node_net_msg_mac(const uint8_t key[32], const node_net_msg_t *msg, uint8_t tag_out[32]);
+bool node_net_msg_verify(const uint8_t key[32], const node_net_msg_t *msg, const uint8_t tag[32]);
 
 #ifdef __cplusplus
 }

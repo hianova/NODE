@@ -523,7 +523,37 @@ static bool test_15_certs_fir_eval(void) {
     }
     uint64_t ins[1] = {UINT64_C(3)};
     uint64_t outs[1] = {UINT64_C(0)};
-    return flow_ir_eval_u64(&g_cert_ws.ir_reloaded, ins, outs) && outs[0] == UINT64_C(6);
+    if (!flow_ir_eval_u64(&g_cert_ws.ir_reloaded, ins, outs) || outs[0] != UINT64_C(6)) {
+        return false;
+    }
+
+    /* Constant-time MAC, eq32 & Z-set overflow checks */
+    uint8_t key[32];
+    uint8_t tag[32];
+    for (size_t i = 0U; i < 32U; ++i) {
+        key[i] = (uint8_t)(i * 7U + 3U);
+    }
+    node_net_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.valid = 1U;
+    msg.kind = 3U;
+    msg.src = 0U;
+    msg.dst = 2U;
+    msg.term = 5U;
+    msg.val = 0xCAFEU;
+    node_net_msg_mac(key, &msg, tag);
+    if (!node_net_msg_verify(key, &msg, tag)) {
+        return false;
+    }
+    msg.term ^= 1U;
+    if (node_net_msg_verify(key, &msg, tag)) {
+        return false;
+    }
+    node_zset_init(&g_tmp_z1);
+    if (node_zset_add_entry(&g_tmp_z1, 1U, INT64_MAX)) {
+        return false;
+    }
+    return true;
 }
 
 static int run_selftest(void) {
@@ -823,10 +853,92 @@ static int cmd_emit_certs(const char *dir) {
     return 0;
 }
 
+static int cmd_audit_replay(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s audit-replay <cap-attenuate|zset-overflow|net-mac> ...\n",
+                argv[0]);
+        return 1;
+    }
+    if (strcmp(argv[2], "cap-attenuate") == 0) {
+        if (argc < 7) {
+            return 1;
+        }
+        uint32_t sbase = (uint32_t)strtoul(argv[3], NULL, 0);
+        uint32_t slen = (uint32_t)strtoul(argv[4], NULL, 0);
+        uint32_t nbase = (uint32_t)strtoul(argv[5], NULL, 0);
+        uint32_t nlen = (uint32_t)strtoul(argv[6], NULL, 0);
+        node_vm_init(&g_vm, 16U);
+        g_vm.state.caps[0].region_id = 0U;
+        g_vm.state.caps[0].base = sbase;
+        g_vm.state.caps[0].len = slen;
+        g_vm.state.caps[0].rights = NODE_CAP_R | NODE_CAP_W | NODE_CAP_G;
+        bool ok = node_vm_attenuate_cap(&g_vm, 1U, 0U, nbase, nlen, NODE_CAP_R);
+        printf("{\"accepted\": %s}\n", ok ? "true" : "false");
+        return 0;
+    }
+    if (strcmp(argv[2], "zset-overflow") == 0) {
+        if (argc < 5) {
+            return 1;
+        }
+        int64_t w1 = (int64_t)strtoll(argv[3], NULL, 0);
+        int64_t w2 = (int64_t)strtoll(argv[4], NULL, 0);
+        node_zset_init(&g_tmp_z1);
+        bool ok1 = node_zset_add_entry(&g_tmp_z1, 1U, w1);
+        bool ok2 = ok1 && node_zset_add_entry(&g_tmp_z1, 1U, w2);
+        printf("{\"accepted\": %s}\n", (ok1 && ok2) ? "true" : "false");
+        return 0;
+    }
+    if (strcmp(argv[2], "net-mac") == 0) {
+        uint8_t key[32];
+        uint8_t tag[32];
+        for (size_t i = 0U; i < 32U; ++i) {
+            key[i] = (uint8_t)(UINT32_C(0xA5) ^ (uint32_t)(i * 13U));
+        }
+        node_net_msg_t base;
+        memset(&base, 0, sizeof(base));
+        base.valid = 1U;
+        base.kind = 3U;
+        base.src = 1U;
+        base.dst = 4U;
+        base.term = 11U;
+        base.index = 7U;
+        base.prev_term = 10U;
+        base.success = 1U;
+        base.val = 0x12345678U;
+        base.entry_term = 11U;
+        base.leader_commit = 6U;
+        node_net_msg_mac(key, &base, tag);
+        bool genuine_ok = node_net_msg_verify(key, &base, tag);
+
+        uint32_t tamper_tests = 10U;
+        uint32_t tamper_rejected = 0U;
+        uint32_t *fields[9] = {&base.kind, &base.src,        &base.dst,
+                               &base.term, &base.index,      &base.prev_term,
+                               &base.val,  &base.entry_term, &base.leader_commit};
+        for (uint32_t k = 0U; k < 9U; ++k) {
+            *fields[k] ^= UINT32_C(1);
+            if (!node_net_msg_verify(key, &base, tag)) {
+                tamper_rejected++;
+            }
+            *fields[k] ^= UINT32_C(1);
+        }
+        tag[0] ^= UINT8_C(1);
+        if (!node_net_msg_verify(key, &base, tag)) {
+            tamper_rejected++;
+        }
+        printf("{\"genuine_ok\": %s, \"tamper_tests\": %u, \"tamper_rejected\": %u}\n",
+               genuine_ok ? "true" : "false", tamper_tests, tamper_rejected);
+        return (genuine_ok && tamper_rejected == tamper_tests) ? 0 : 1;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <selftest|vm-demo|dbsp-demo|wal-audit|dst|emit-certs DIR>\n",
-                argv[0]);
+        fprintf(
+            stderr,
+            "Usage: %s <selftest|vm-demo|dbsp-demo|wal-audit|dst|audit-replay|emit-certs DIR>\n",
+            argv[0]);
         return 1;
     }
     if (strcmp(argv[1], "selftest") == 0) {
@@ -843,6 +955,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "dst") == 0) {
         return cmd_dst(argc, argv);
+    }
+    if (strcmp(argv[1], "audit-replay") == 0) {
+        return cmd_audit_replay(argc, argv);
     }
     if (strcmp(argv[1], "emit-certs") == 0) {
         const char *dir = (argc >= 3) ? argv[2] : "build/certs";
