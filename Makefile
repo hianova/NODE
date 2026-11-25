@@ -178,7 +178,7 @@ gate8-auditor: $(BUILD)/node $(BUILD)/node_ring0.o
 	CC=$(CC) python3 tools/node_auditor_check.py
 
 experiments: $(BUILD)/node
-	@echo "[Experiments] Running Layer 1-3 Trinity Benchmarks & BLOOM GPU Witness Verification..."
+	@echo "[Experiments] Running Layer 1-3 Trinity Benchmarks..."
 	python3 experiments/node_trinity_benchmark.py
 	@echo "[Experiments] PASS"
 
