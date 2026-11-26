@@ -121,30 +121,14 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M10_zset_keep_zero_weight",
             "zset_abelian",
-            "        int64_t nw = z->entries[lo].weight + weight;\n"
-            "        if (!node_zset_weight_ok(nw)) {\n"
-            "            return false;\n"
-            "        }\n"
-            "        if (nw == INT64_C(0)) {",
-            "        int64_t nw = z->entries[lo].weight + weight;\n"
-            "        if (!node_zset_weight_ok(nw)) {\n"
-            "            return false;\n"
-            "        }\n"
-            "        if (false && nw == INT64_C(0)) {",
+            "        int64_t nw = (int64_t)nw128;\n        if (nw == INT64_C(0)) {",
+            "        int64_t nw = (int64_t)nw128;\n        if (false && nw == INT64_C(0)) {",
         ),
         NodeMutant(
             "M11_zset_combine_keep_zero",
             "zset_abelian",
-            "            int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;\n"
-            "            if (!node_zset_weight_ok(w)) {\n"
-            "                return false;\n"
-            "            }\n"
-            "            if (w != INT64_C(0)) {",
-            "            int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;\n"
-            "            if (!node_zset_weight_ok(w)) {\n"
-            "                return false;\n"
-            "            }\n"
-            "            if (true || w != INT64_C(0)) {",
+            "            int64_t w = (int64_t)w128;\n            if (w != INT64_C(0)) {",
+            "            int64_t w = (int64_t)w128;\n            if (true || w != INT64_C(0)) {",
         ),
         NodeMutant(
             "M12_zset_sub_wrong_sign",
