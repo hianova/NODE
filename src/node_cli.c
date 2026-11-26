@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "node.h"
 #include "node_cert.h"
 #include "node_disk_wal.h"
