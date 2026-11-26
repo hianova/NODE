@@ -432,10 +432,11 @@ bool node_zset_add_entry(node_zset_t *z, uint64_t key, int64_t weight) {
         if (!node_zset_weight_ok(z->entries[lo].weight)) {
             return false;
         }
-        int64_t nw = z->entries[lo].weight + weight;
-        if (!node_zset_weight_ok(nw)) {
+        flow_i128 nw128 = (flow_i128)z->entries[lo].weight + (flow_i128)weight;
+        if (nw128 < -(flow_i128)NODE_ZSET_MAX_WEIGHT || nw128 > (flow_i128)NODE_ZSET_MAX_WEIGHT) {
             return false;
         }
+        int64_t nw = (int64_t)nw128;
         if (nw == INT64_C(0)) {
             for (uint32_t k = lo; k + 1U < z->len; ++k) {
                 z->entries[k].key = z->entries[k + 1U].key;
@@ -465,6 +466,9 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
     if (a == NULL || b == NULL || out == NULL) {
         return false;
     }
+    if (b_sign != INT64_C(1) && b_sign != INT64_C(-1)) {
+        return false;
+    }
     node_zset_init(out);
     uint32_t i = 0U;
     uint32_t j = 0U;
@@ -472,7 +476,7 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
         uint64_t ka = a->entries[i].key;
         uint64_t kb = b->entries[j].key;
         if (ka < kb) {
-            if (out->len >= NODE_ZSET_CAP) {
+            if (out->len >= NODE_ZSET_CAP || !node_zset_weight_ok(a->entries[i].weight)) {
                 return false;
             }
             out->entries[out->len].key = ka;
@@ -480,11 +484,12 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
             out->len++;
             i++;
         } else if (kb < ka) {
-            if (out->len >= NODE_ZSET_CAP) {
+            if (out->len >= NODE_ZSET_CAP || !node_zset_weight_ok(b->entries[j].weight)) {
                 return false;
             }
+            int64_t bw = (b_sign < INT64_C(0)) ? -b->entries[j].weight : b->entries[j].weight;
             out->entries[out->len].key = kb;
-            out->entries[out->len].weight = b_sign * b->entries[j].weight;
+            out->entries[out->len].weight = bw;
             out->len++;
             j++;
         } else {
@@ -492,10 +497,12 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
                 !node_zset_weight_ok(b->entries[j].weight)) {
                 return false;
             }
-            int64_t w = a->entries[i].weight + b_sign * b->entries[j].weight;
-            if (!node_zset_weight_ok(w)) {
+            int64_t bw = (b_sign < INT64_C(0)) ? -b->entries[j].weight : b->entries[j].weight;
+            flow_i128 w128 = (flow_i128)a->entries[i].weight + (flow_i128)bw;
+            if (w128 < -(flow_i128)NODE_ZSET_MAX_WEIGHT || w128 > (flow_i128)NODE_ZSET_MAX_WEIGHT) {
                 return false;
             }
+            int64_t w = (int64_t)w128;
             if (w != INT64_C(0)) {
                 if (out->len >= NODE_ZSET_CAP) {
                     return false;
@@ -521,8 +528,9 @@ static bool zset_linear_combine(const node_zset_t *a, const node_zset_t *b, int6
         if (out->len >= NODE_ZSET_CAP || !node_zset_weight_ok(b->entries[j].weight)) {
             return false;
         }
+        int64_t bw = (b_sign < INT64_C(0)) ? -b->entries[j].weight : b->entries[j].weight;
         out->entries[out->len].key = b->entries[j].key;
-        out->entries[out->len].weight = b_sign * b->entries[j].weight;
+        out->entries[out->len].weight = bw;
         out->len++;
         j++;
     }

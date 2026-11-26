@@ -1,0 +1,25 @@
+# FLOW v10.0.0 ArenaSchema: 64-byte NODE VM & Consensus Wire Cells
+arena 4 node_wire build/node_wire.h node_wire_cell_t node_wire_map_t node_wire_arena_t
+
+layout vm_meta node_vm_meta_wire_t
+  field pc 0 u64 1
+  field fuel_budget 64 u64 1
+  field fuel_used 128 u64 1
+  field caps_mask 192 u64 1
+  field fault_code 256 u64 1
+  field reg_hash 320 u64 1
+  field snap_count 384 u64 1
+  field replay_ok 448 u64 1
+
+layout consensus_meta node_consensus_meta_wire_t
+  field nodes 0 u64 1
+  field faulty_f 64 u64 1
+  field quorum_q 128 u64 1
+  field rounds 192 u64 1
+  field commits 256 u64 1
+  field safety_violations 320 u64 1
+  field crdt_converged 384 u64 1
+  field state_root 448 u64 1
+
+region vm 0 2 vm_meta NODE_SLOT_VM -
+region consensus 2 2 consensus_meta NODE_SLOT_CONSENSUS -
