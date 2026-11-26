@@ -16,9 +16,11 @@ AR ?= ar
 ifeq ($(UNAME_S),Darwin)
 LLVM_PREFIX ?= /opt/homebrew/opt/llvm/bin
 LDFLAGS_STRIP := -Wl,-dead_strip
+POSIX_HOST_FLAGS :=
 else
 LLVM_PREFIX ?= /usr/bin
 LDFLAGS_STRIP := -Wl,--gc-sections
+POSIX_HOST_FLAGS := -D_POSIX_C_SOURCE=200809L
 endif
 ifneq ($(wildcard $(LLVM_PREFIX)/clang),)
 DEFAULT_CC := $(LLVM_PREFIX)/clang
@@ -43,7 +45,7 @@ CLANG_TIDY ?= $(DEFAULT_TIDY)
 C17_RING0_FLAGS := -std=c17 -O2 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
 	-fno-jump-tables -mgeneral-regs-only -ffunction-sections -fdata-sections \
 	-Wall -Wextra -Werror -Wpedantic -Wconversion -Wundef -Wmissing-prototypes
-C17_HOST_FLAGS := -std=c17 -O2 -ffunction-sections -fdata-sections \
+C17_HOST_FLAGS := -std=c17 -O2 -ffunction-sections -fdata-sections $(POSIX_HOST_FLAGS) \
 	-Wall -Wextra -Werror -Wpedantic -Wconversion -Wundef -Wmissing-prototypes
 INC_RING0 := -Iinclude -I$(BUILD) -isystem $(FLOW_DIR)/core -isystem $(FLOW_DIR)/sdk
 INC_HOST := -Iinclude -I$(BUILD) -isystem $(FLOW_DIR)/core -isystem $(FLOW_DIR)/sdk $(INFO_HOST_FLAGS)
