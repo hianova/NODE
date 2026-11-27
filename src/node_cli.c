@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include "flow_wire_pack.h"
 #include "node.h"
 #include "node_cert.h"
 #include "node_disk_wal.h"
@@ -31,9 +32,71 @@ static node_raft_cluster_t g_raft;
 static node_bft_cluster_t g_bft;
 static node_cert_ws_t g_cert_ws;
 static NodeArena g_arena;
+static NodeArena g_cli_arena_tmp;
 static node_dbsp_reach_t g_reach;
 static node_dyn_tri_t g_tri;
 static node_replay_win_t g_win;
+static uint8_t g_cli_wire_a[FLOW_IR_MAX_FILE_BYTES];
+static uint8_t g_cli_wire_b[FLOW_IR_MAX_FILE_BYTES];
+static uint8_t g_cli_arena_wire[32768];
+static flow_ir_prog_t g_cli_ir_tmp;
+
+static bool node_cli_read_bin_file(const char *path, uint8_t *buf, size_t cap, size_t *out_len) {
+    if (path == NULL || buf == NULL || out_len == NULL || cap == 0U) {
+        return false;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return false;
+    }
+    size_t n = fread(buf, 1U, cap, fp);
+    int extra = fgetc(fp);
+    (void)fclose(fp);
+    if (extra != EOF) {
+        return false;
+    }
+    *out_len = n;
+    return true;
+}
+
+static bool node_cli_arena_pack_flwa(const NodeArena *arena, uint8_t *out, size_t out_cap,
+                                     size_t *out_len) {
+    if (arena == NULL) {
+        return false;
+    }
+    return flow_arena_pack_bytes((const uint8_t *)arena, sizeof(*arena), out, out_cap, out_len);
+}
+
+static bool node_cli_arena_decode_auto(const uint8_t *buf, size_t len, NodeArena *out,
+                                       bool *was_flwa_out) {
+    if (buf == NULL || out == NULL) {
+        return false;
+    }
+    if (len >= (size_t)FLOW_ARENA_PACK_HDR_B + 8U &&
+        flow_ir_wire_read_le32(buf) == FLOW_ARENA_PACK_MAGIC) {
+        size_t raw_len = 0U;
+        if (!flow_arena_unpack_bytes(buf, len, (uint8_t *)out, sizeof(*out), &raw_len) ||
+            raw_len != sizeof(*out)) {
+            return false;
+        }
+        if (was_flwa_out != NULL) {
+            *was_flwa_out = true;
+        }
+        return true;
+    }
+    if (len == sizeof(*out)) {
+        memcpy(out, buf, sizeof(*out));
+        if (out->map.hdr.magic != NODE_SCHEMA_MAGIC ||
+            out->map.hdr.version != NODE_SCHEMA_VERSION) {
+            return false;
+        }
+        if (was_flwa_out != NULL) {
+            *was_flwa_out = false;
+        }
+        return true;
+    }
+    return false;
+}
 
 static void build_demo_vm_prog(node_vm_prog_t *prog) {
     memset(prog, 0, sizeof(*prog));
@@ -504,8 +567,44 @@ static bool test_13_pncounter_merge_dups(void) {
 
 static bool test_14_arena_schema_fill(void) {
     node_arena_fill_summary(&g_arena, &g_vm, &g_dbsp, &g_wal, NULL);
-    return sizeof(g_arena) == 16384U && g_arena.map.hdr.magic == NODE_SCHEMA_MAGIC &&
-           g_arena.map.hdr.version == NODE_SCHEMA_VERSION && g_arena.map.dbsp_meta[0].epoch == 10U;
+    if (sizeof(g_arena) != 16384U || g_arena.map.hdr.magic != NODE_SCHEMA_MAGIC ||
+        g_arena.map.hdr.version != NODE_SCHEMA_VERSION || g_arena.map.dbsp_meta[0].epoch != 10U) {
+        return false;
+    }
+
+    /* "FLWA" sparse 64B arena pack + auto-decode + bit-exact roundtrip */
+    size_t pk_len = 0U;
+    if (!node_cli_arena_pack_flwa(&g_arena, g_cli_arena_wire, sizeof(g_cli_arena_wire), &pk_len) ||
+        pk_len == 0U || pk_len >= 512U) {
+        return false;
+    }
+    bool was_flwa = false;
+    memset(&g_cli_arena_tmp, 0xA5, sizeof(g_cli_arena_tmp));
+    if (!node_cli_arena_decode_auto(g_cli_arena_wire, pk_len, &g_cli_arena_tmp, &was_flwa) ||
+        !was_flwa || memcmp(&g_arena, &g_cli_arena_tmp, sizeof(g_arena)) != 0) {
+        return false;
+    }
+    size_t rt_pk_len = 0U;
+    if (!node_cli_arena_pack_flwa(&g_cli_arena_tmp, g_cli_wire_a, sizeof(g_cli_wire_a),
+                                  &rt_pk_len) ||
+        rt_pk_len != pk_len || memcmp(g_cli_wire_a, g_cli_arena_wire, pk_len) != 0) {
+        return false;
+    }
+
+    /* Transparent auto-decode of legacy raw 16,384 B arena binary */
+    memset(&g_cli_arena_tmp, 0, sizeof(g_cli_arena_tmp));
+    if (!node_cli_arena_decode_auto((const uint8_t *)&g_arena, sizeof(g_arena), &g_cli_arena_tmp,
+                                    &was_flwa) ||
+        was_flwa || memcmp(&g_arena, &g_cli_arena_tmp, sizeof(g_arena)) != 0) {
+        return false;
+    }
+
+    /* 1-bit MAC tamper on FLWA trailer must be rejected */
+    g_cli_arena_wire[pk_len - 1U] ^= UINT8_C(0x01);
+    if (node_cli_arena_decode_auto(g_cli_arena_wire, pk_len, &g_cli_arena_tmp, &was_flwa)) {
+        return false;
+    }
+    return true;
 }
 
 static bool test_15_certs_fir_eval(void) {
@@ -522,17 +621,50 @@ static bool test_15_certs_fir_eval(void) {
     uint32_t xr = flow_ir_emit_op2(p, FLOW_IR_OP_XOR_VEC, 4U, 0U, c1, "xr");
     p->num_outputs = 1U;
     p->outputs[0] = xr;
-    if (!flow_ir_encode_bytes(p, g_cert_ws.wire_buf, sizeof(g_cert_ws.wire_buf),
-                              &g_cert_ws.wire_len)) {
+
+    /* Encode both legacy "FIR1" and packed "FIR2" and verify transparent auto-decode + roundtrip */
+    size_t fir1_len = 0U;
+    if (!flow_ir_encode_bytes(p, g_cli_wire_a, sizeof(g_cli_wire_a), &fir1_len)) {
+        return false;
+    }
+    if (!flow_ir_encode_packed_bytes(p, g_cert_ws.wire_buf, sizeof(g_cert_ws.wire_buf),
+                                     &g_cert_ws.wire_len) ||
+        g_cert_ws.wire_len >= fir1_len) {
         return false;
     }
     if (flow_ir_load_bytes_fiber(&g_cert_ws.ir_reloaded, g_cert_ws.wire_buf, g_cert_ws.wire_len) !=
-        FLOW_IR_FIBER_COMMITTED) {
+            FLOW_IR_FIBER_COMMITTED ||
+        !node_cert_progs_equal(p, &g_cert_ws.ir_reloaded)) {
+        return false;
+    }
+    if (flow_ir_load_bytes_fiber(&g_cli_ir_tmp, g_cli_wire_a, fir1_len) !=
+            FLOW_IR_FIBER_COMMITTED ||
+        !node_cert_progs_equal(p, &g_cli_ir_tmp)) {
+        return false;
+    }
+    size_t rt_fir1_len = 0U;
+    if (!flow_ir_encode_bytes(&g_cert_ws.ir_reloaded, g_cli_wire_b, sizeof(g_cli_wire_b),
+                              &rt_fir1_len) ||
+        rt_fir1_len != fir1_len || memcmp(g_cli_wire_a, g_cli_wire_b, fir1_len) != 0) {
         return false;
     }
     uint64_t ins[1] = {UINT64_C(3)};
     uint64_t outs[1] = {UINT64_C(0)};
     if (!flow_ir_eval_u64(&g_cert_ws.ir_reloaded, ins, outs) || outs[0] != UINT64_C(6)) {
+        return false;
+    }
+    /* 1-bit tamper on FIR2 trailer must fail with MAC fiber */
+    g_cert_ws.wire_buf[g_cert_ws.wire_len - 1U] ^= UINT8_C(0x01);
+    if (flow_ir_load_bytes_fiber(&g_cli_ir_tmp, g_cert_ws.wire_buf, g_cert_ws.wire_len) !=
+        FLOW_IR_FIBER_FALLBACK_MAC) {
+        return false;
+    }
+
+    /* Emit + auto-load + bit-exact roundtrip of all cert circuits in FIR2 */
+    const char *tmp_fir2 = "/tmp/node_selftest_cap.fir2";
+    if (!node_cert_emit_cap_fir(&g_cert_ws, tmp_fir2) ||
+        !node_cert_load_auto_file(&g_cli_ir_tmp, tmp_fir2, g_cli_wire_a, sizeof(g_cli_wire_a)) ||
+        !node_cert_progs_equal(&g_cert_ws.ir_prog, &g_cli_ir_tmp)) {
         return false;
     }
 
@@ -952,37 +1084,62 @@ static int cmd_emit_certs(const char *dir) {
     char fir_p[512];
     char lean_p[512];
     char json_p[512];
+    size_t legacy_total = 0U;
+    size_t packed_total = 0U;
+    node_cert_size_stats_t st;
 
-    (void)snprintf(fir_p, sizeof(fir_p), "%s/cap_isolation.fir", dir);
+    (void)snprintf(fir_p, sizeof(fir_p), "%s/cap_isolation.fir2", dir);
     (void)snprintf(lean_p, sizeof(lean_p), "%s/cap_isolation.lean", dir);
     (void)snprintf(json_p, sizeof(json_p), "%s/cap_isolation.json", dir);
     if (!node_cert_emit_cap_fir(&g_cert_ws, fir_p) || !node_cert_emit_cap_lean(lean_p) ||
         !node_cert_emit_json(json_p, "cap_isolation", fir_p, lean_p, 16U, "UNSAT")) {
         return 1;
     }
+    if (flow_ir_encode_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, sizeof(g_cli_wire_a),
+                             &st.legacy_fir1_bytes)) {
+        legacy_total += st.legacy_fir1_bytes;
+    }
+    packed_total += g_cert_ws.wire_len;
 
-    (void)snprintf(fir_p, sizeof(fir_p), "%s/bft_quorum_safety.fir", dir);
+    (void)snprintf(fir_p, sizeof(fir_p), "%s/bft_quorum_safety.fir2", dir);
     (void)snprintf(lean_p, sizeof(lean_p), "%s/bft_quorum_safety.lean", dir);
     (void)snprintf(json_p, sizeof(json_p), "%s/bft_quorum_safety.json", dir);
     if (!node_cert_emit_bft_fir(&g_cert_ws, fir_p, false) || !node_cert_emit_bft_lean(lean_p) ||
         !node_cert_emit_json(json_p, "bft_quorum_safety", fir_p, lean_p, 12U, "UNSAT")) {
         return 1;
     }
+    if (flow_ir_encode_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, sizeof(g_cli_wire_a),
+                             &st.legacy_fir1_bytes)) {
+        legacy_total += st.legacy_fir1_bytes;
+    }
+    packed_total += g_cert_ws.wire_len;
 
-    (void)snprintf(fir_p, sizeof(fir_p), "%s/bft_quorum_buggy.fir", dir);
+    (void)snprintf(fir_p, sizeof(fir_p), "%s/bft_quorum_buggy.fir2", dir);
     if (!node_cert_emit_bft_fir(&g_cert_ws, fir_p, true)) {
         return 1;
     }
+    if (flow_ir_encode_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, sizeof(g_cli_wire_a),
+                             &st.legacy_fir1_bytes)) {
+        legacy_total += st.legacy_fir1_bytes;
+    }
+    packed_total += g_cert_ws.wire_len;
 
-    (void)snprintf(fir_p, sizeof(fir_p), "%s/dbsp_join_delta.fir", dir);
+    (void)snprintf(fir_p, sizeof(fir_p), "%s/dbsp_join_delta.fir2", dir);
     (void)snprintf(lean_p, sizeof(lean_p), "%s/dbsp_join_delta.lean", dir);
     (void)snprintf(json_p, sizeof(json_p), "%s/dbsp_join_delta.json", dir);
     if (!node_cert_emit_dbsp_fir(&g_cert_ws, fir_p) || !node_cert_emit_dbsp_lean(lean_p) ||
         !node_cert_emit_json(json_p, "dbsp_join_delta", fir_p, lean_p, 16U, "UNSAT")) {
         return 1;
     }
+    if (flow_ir_encode_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, sizeof(g_cli_wire_a),
+                             &st.legacy_fir1_bytes)) {
+        legacy_total += st.legacy_fir1_bytes;
+    }
+    packed_total += g_cert_ws.wire_len;
 
-    printf("[NODE CERTS] Emitted 4 .fir + 3 .lean + 3 .json certificates into %s/\n", dir);
+    printf(
+        "[NODE CERTS] Emitted 4 .fir2 (FIR2 packed) + 3 .lean + 3 .json certificates into %s/ (%zu B packed vs %zu B legacy FIR1)\n",
+        dir, packed_total, legacy_total);
     return 0;
 }
 
@@ -1093,12 +1250,148 @@ static int cmd_disk_compact(const char *dir_path) {
     printf("  \"torn_rejected\": %u,\n", rep.torn_rejected);
     printf("  \"raw_snap_bytes\": %u,\n", rep.raw_snap_bytes);
     printf("  \"compressed_snap_bytes\": %u,\n", rep.compressed_snap_bytes);
-    printf("  \"codec\": \"%s\",\n", rep.have_info_codec ? "INFO_INF1" : "RLE_FALLBACK");
+    printf("  \"codec\": \"%s\",\n",
+           (rep.codec_used == NODE_DISK_CODEC_FLWA) ? "FLOW_FLWA" : "LEGACY");
     printf("  \"roundtrip_exact\": %s,\n", rep.roundtrip_exact ? "true" : "false");
+    printf("  \"legacy_auto_decode_exact\": %s,\n",
+           rep.legacy_auto_decode_exact ? "true" : "false");
     printf("  \"elapsed_us\": %" PRIu64 ",\n", rep.elapsed_us);
     printf("  \"passed\": %s\n", ok ? "true" : "false");
     printf("}\n");
     return ok ? 0 : 1;
+}
+
+static int cmd_arena_pack(const char *in_path, const char *out_path) {
+    size_t in_len = 0U;
+    bool was_flwa = false;
+    if (!node_cli_read_bin_file(in_path, g_cli_arena_wire, sizeof(g_cli_arena_wire), &in_len) ||
+        !node_cli_arena_decode_auto(g_cli_arena_wire, in_len, &g_arena, &was_flwa)) {
+        fprintf(stderr, "arena-pack: failed to auto-decode '%s'\n", in_path);
+        return 1;
+    }
+    size_t out_len = 0U;
+    if (!node_cli_arena_pack_flwa(&g_arena, g_cli_arena_wire, sizeof(g_cli_arena_wire), &out_len)) {
+        fprintf(stderr, "arena-pack: failed to pack '%s'\n", in_path);
+        return 1;
+    }
+    bool rt_flwa = false;
+    memset(&g_cli_arena_tmp, 0, sizeof(g_cli_arena_tmp));
+    bool rt_exact =
+        node_cli_arena_decode_auto(g_cli_arena_wire, out_len, &g_cli_arena_tmp, &rt_flwa) &&
+        rt_flwa && memcmp(&g_arena, &g_cli_arena_tmp, sizeof(g_arena)) == 0;
+    if (!rt_exact || !flow_ir_write_bytes_file(out_path, g_cli_arena_wire, out_len)) {
+        fprintf(stderr, "arena-pack: roundtrip or write failed for '%s'\n", out_path);
+        return 1;
+    }
+    printf("{\n");
+    printf("  \"codec\": \"FLOW_FLWA\",\n");
+    printf("  \"raw_bytes\": %zu,\n", sizeof(g_arena));
+    printf("  \"in_bytes\": %zu,\n", in_len);
+    printf("  \"packed_bytes\": %zu,\n", out_len);
+    printf("  \"was_packed_input\": %s,\n", was_flwa ? "true" : "false");
+    printf("  \"roundtrip_exact\": %s\n", rt_exact ? "true" : "false");
+    printf("}\n");
+    return 0;
+}
+
+static int cmd_arena_unpack(const char *in_path, const char *out_path) {
+    size_t in_len = 0U;
+    bool was_flwa = false;
+    if (!node_cli_read_bin_file(in_path, g_cli_arena_wire, sizeof(g_cli_arena_wire), &in_len) ||
+        !node_cli_arena_decode_auto(g_cli_arena_wire, in_len, &g_arena, &was_flwa)) {
+        fprintf(stderr, "arena-unpack: failed to auto-decode '%s'\n", in_path);
+        return 1;
+    }
+    if (!flow_ir_write_bytes_file(out_path, (const uint8_t *)&g_arena, sizeof(g_arena))) {
+        fprintf(stderr, "arena-unpack: failed to write '%s'\n", out_path);
+        return 1;
+    }
+    printf("{\n");
+    printf("  \"in_bytes\": %zu,\n", in_len);
+    printf("  \"raw_bytes\": %zu,\n", sizeof(g_arena));
+    printf("  \"was_packed_input\": %s\n", was_flwa ? "true" : "false");
+    printf("}\n");
+    return 0;
+}
+
+static int cmd_fir_pack(const char *in_path, const char *out_path) {
+    size_t in_len = 0U;
+    if (!node_cli_read_bin_file(in_path, g_cli_wire_a, sizeof(g_cli_wire_a), &in_len) ||
+        !node_cert_load_auto_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, in_len)) {
+        fprintf(stderr, "fir-pack: failed to auto-decode '%s'\n", in_path);
+        return 1;
+    }
+    size_t out_len = 0U;
+    if (!flow_ir_encode_packed_bytes(&g_cert_ws.ir_prog, g_cli_wire_b, sizeof(g_cli_wire_b),
+                                     &out_len)) {
+        fprintf(stderr, "fir-pack: failed to pack '%s'\n", in_path);
+        return 1;
+    }
+    bool rt_exact = node_cert_load_auto_bytes(&g_cli_ir_tmp, g_cli_wire_b, out_len) &&
+                    node_cert_progs_equal(&g_cert_ws.ir_prog, &g_cli_ir_tmp);
+    if (!rt_exact || !flow_ir_write_bytes_file(out_path, g_cli_wire_b, out_len)) {
+        fprintf(stderr, "fir-pack: roundtrip or write failed for '%s'\n", out_path);
+        return 1;
+    }
+    printf("{\n");
+    printf("  \"codec\": \"FLOW_FIR2\",\n");
+    printf("  \"in_bytes\": %zu,\n", in_len);
+    printf("  \"packed_bytes\": %zu,\n", out_len);
+    printf("  \"roundtrip_exact\": %s\n", rt_exact ? "true" : "false");
+    printf("}\n");
+    return 0;
+}
+
+static int cmd_fir_unpack(const char *in_path, const char *out_path) {
+    size_t in_len = 0U;
+    if (!node_cli_read_bin_file(in_path, g_cli_wire_a, sizeof(g_cli_wire_a), &in_len) ||
+        !node_cert_load_auto_bytes(&g_cert_ws.ir_prog, g_cli_wire_a, in_len)) {
+        fprintf(stderr, "fir-unpack: failed to auto-decode '%s'\n", in_path);
+        return 1;
+    }
+    size_t out_len = 0U;
+    if (!flow_ir_encode_bytes(&g_cert_ws.ir_prog, g_cli_wire_b, sizeof(g_cli_wire_b), &out_len)) {
+        fprintf(stderr, "fir-unpack: failed to encode FIR1 '%s'\n", in_path);
+        return 1;
+    }
+    bool rt_exact = node_cert_load_auto_bytes(&g_cli_ir_tmp, g_cli_wire_b, out_len) &&
+                    node_cert_progs_equal(&g_cert_ws.ir_prog, &g_cli_ir_tmp);
+    if (!rt_exact || !flow_ir_write_bytes_file(out_path, g_cli_wire_b, out_len)) {
+        fprintf(stderr, "fir-unpack: roundtrip or write failed for '%s'\n", out_path);
+        return 1;
+    }
+    printf("{\n");
+    printf("  \"codec\": \"FLOW_FIR1\",\n");
+    printf("  \"in_bytes\": %zu,\n", in_len);
+    printf("  \"unpacked_bytes\": %zu,\n", out_len);
+    printf("  \"roundtrip_exact\": %s\n", rt_exact ? "true" : "false");
+    printf("}\n");
+    return 0;
+}
+
+static int cmd_snap_unpack(const char *in_path, const char *out_path) {
+    size_t in_len = 0U;
+    if (!node_cli_read_bin_file(in_path, g_disk_snap_comp, sizeof(g_disk_snap_comp), &in_len)) {
+        fprintf(stderr, "snap-unpack: failed to read '%s'\n", in_path);
+        return 1;
+    }
+    size_t dec_len = 0U;
+    uint32_t dec_codec = 0U;
+    if (!node_disk_snap_unpack_auto(g_disk_snap_comp, in_len, g_disk_snap_decomp,
+                                    sizeof(g_disk_snap_decomp), &dec_len, &dec_codec) ||
+        !flow_ir_write_bytes_file(out_path, g_disk_snap_decomp, dec_len)) {
+        fprintf(stderr, "snap-unpack: failed on '%s'\n", in_path);
+        return 1;
+    }
+    const char *cname = (dec_codec == NODE_DISK_CODEC_FLWA)
+                            ? "FLOW_FLWA"
+                            : ((dec_codec == NODE_DISK_CODEC_INF1) ? "INFO_INF1" : "LEGACY_RLE");
+    printf("{\n");
+    printf("  \"codec\": \"%s\",\n", cname);
+    printf("  \"in_bytes\": %zu,\n", in_len);
+    printf("  \"unpacked_bytes\": %zu\n", dec_len);
+    printf("}\n");
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -1106,7 +1399,9 @@ int main(int argc, char **argv) {
         fprintf(
             stderr,
             "Usage: %s "
-            "<selftest|vm-demo|dbsp-demo|wal-audit|dst|udp-loopback|disk-compact|audit-replay|emit-certs DIR>\n",
+            "<selftest|vm-demo|dbsp-demo|wal-audit|dst|udp-loopback|disk-compact|audit-replay|"
+            "emit-certs DIR|arena-pack IN OUT|arena-unpack IN OUT|fir-pack IN OUT|fir-unpack IN OUT|"
+            "snap-unpack IN OUT>\n",
             argv[0]);
         return 1;
     }
@@ -1139,6 +1434,21 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "emit-certs") == 0) {
         const char *dir = (argc >= 3) ? argv[2] : "build/certs";
         return cmd_emit_certs(dir);
+    }
+    if (strcmp(argv[1], "arena-pack") == 0 && argc == 4) {
+        return cmd_arena_pack(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "arena-unpack") == 0 && argc == 4) {
+        return cmd_arena_unpack(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "fir-pack") == 0 && argc == 4) {
+        return cmd_fir_pack(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "fir-unpack") == 0 && argc == 4) {
+        return cmd_fir_unpack(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "snap-unpack") == 0 && argc == 4) {
+        return cmd_snap_unpack(argv[2], argv[3]);
     }
     fprintf(stderr, "Unknown subcommand: %s\n", argv[1]);
     return 1;

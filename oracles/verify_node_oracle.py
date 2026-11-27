@@ -128,6 +128,73 @@ def verify_emitted_certs() -> None:
     res = run_cmd([str(NODE_BIN), "emit-certs", str(certs_dir)])
     assert res.returncode == 0, res.stderr
 
+    # Verify canonical "FIR2" packed certs, legacy "FIR1" auto-decode, and bit-exact roundtrip
+    fir2_names = [
+        "cap_isolation.fir2",
+        "bft_quorum_safety.fir2",
+        "bft_quorum_buggy.fir2",
+        "dbsp_join_delta.fir2",
+    ]
+    total_fir2_bytes = 0
+    total_fir1_bytes = 0
+    for fn in fir2_names:
+        p_fir2 = certs_dir / fn
+        assert p_fir2.exists(), f"missing {p_fir2}"
+        raw2 = p_fir2.read_bytes()
+        assert raw2[:4] == b"FIR2", f"{fn} missing FIR2 magic"
+        total_fir2_bytes += len(raw2)
+
+        p_fir1 = certs_dir / (fn[:-1])
+        p_rt2 = certs_dir / (fn + ".rt")
+        u = run_cmd([str(NODE_BIN), "fir-unpack", str(p_fir2), str(p_fir1)])
+        assert u.returncode == 0, u.stderr
+        raw1 = p_fir1.read_bytes()
+        assert raw1[:4] == b"FIR1", f"{fn} unpack missing FIR1 magic"
+        total_fir1_bytes += len(raw1)
+
+        pk = run_cmd([str(NODE_BIN), "fir-pack", str(p_fir1), str(p_rt2)])
+        assert pk.returncode == 0, pk.stderr
+        assert p_rt2.read_bytes() == raw2, f"{fn} FIR1->FIR2 roundtrip mismatch"
+        p_fir1.unlink()
+        p_rt2.unlink()
+    assert total_fir2_bytes * 4 < total_fir1_bytes, (total_fir2_bytes, total_fir1_bytes)
+
+    # Verify "FLWA" sparse 64B arena pack/unpack & legacy raw 16384B auto-decode roundtrip
+    arena_raw_p = certs_dir / "_oracle_arena.bin"
+    arena_flwa_p = certs_dir / "_oracle_arena.flwa"
+    arena_rt_p = certs_dir / "_oracle_arena_rt.bin"
+    arena_buf = bytearray(16384)
+    arena_buf[0:4] = (0x4E4F4445).to_bytes(4, "little")  # NODE_SCHEMA_MAGIC
+    arena_buf[4:8] = (1).to_bytes(4, "little")  # NODE_SCHEMA_VERSION
+    arena_buf[64:72] = (42).to_bytes(8, "little")  # vm_meta.pc
+    arena_buf[128:136] = (10).to_bytes(8, "little")  # dbsp_meta[0].epoch
+    arena_buf[255 * 64 + 56 : 256 * 64] = (0xDEADBEEFCAFEBABE).to_bytes(8, "little")
+    arena_raw_p.write_bytes(bytes(arena_buf))
+    ap = run_cmd([str(NODE_BIN), "arena-pack", str(arena_raw_p), str(arena_flwa_p)])
+    assert ap.returncode == 0, ap.stderr
+    flwa_bytes = arena_flwa_p.read_bytes()
+    assert flwa_bytes[:4] == b"FLWA" and len(flwa_bytes) < 256, len(flwa_bytes)
+    au = run_cmd([str(NODE_BIN), "arena-unpack", str(arena_flwa_p), str(arena_rt_p)])
+    assert au.returncode == 0, au.stderr
+    assert arena_rt_p.read_bytes() == bytes(arena_buf), "FLWA arena roundtrip mismatch"
+    arena_raw_p.unlink()
+    arena_flwa_p.unlink()
+    arena_rt_p.unlink()
+
+    # Verify disk WAL "FLWA" snapshot pack + snap-unpack roundtrip
+    wal_dir = Path("/tmp/node_oracle_wal")
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    dc = run_cmd([str(NODE_BIN), "disk-compact", str(wal_dir)])
+    assert dc.returncode == 0, dc.stderr
+    dcd = json.loads(dc.stdout)
+    assert dcd["codec"] == "FLOW_FLWA" and dcd["roundtrip_exact"] and dcd["legacy_auto_decode_exact"], dcd
+    snap_flwa = wal_dir / "snap_0001.flwa"
+    assert snap_flwa.exists() and snap_flwa.read_bytes()[:4] == b"FLWA"
+    snap_rt = wal_dir / "snap_rt.bin"
+    su = run_cmd([str(NODE_BIN), "snap-unpack", str(snap_flwa), str(snap_rt)])
+    assert su.returncode == 0, su.stderr
+    assert len(snap_rt.read_bytes()) == 4096
+
     # Pure-Python exhaustive verification of the three invariants & buggy witness
     # 1. cap_isolation
     cap_hits = 0

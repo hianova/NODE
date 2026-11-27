@@ -3,26 +3,131 @@
 
 #include "flow_ir_builder.h"
 #include "flow_ir_io.h"
+#include "flow_wire_pack.h"
 #include "node.h"
 
 #include <stdio.h>
+#include <string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef flow_ir_builder_ws_t node_cert_ws_t;
 
-static inline bool node_cert_seal_cartesian_fir(node_cert_ws_t *ws, const char *out_fir_path) {
+typedef struct {
+    size_t legacy_fir1_bytes;
+    size_t packed_fir2_bytes;
+} node_cert_size_stats_t;
+
+static inline bool node_cert_progs_equal(const flow_ir_prog_t *a, const flow_ir_prog_t *b) {
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    if (a->mult != b->mult || a->flags != b->flags || a->num_vals != b->num_vals ||
+        a->num_inputs != b->num_inputs || a->num_outputs != b->num_outputs ||
+        a->num_ops != b->num_ops || a->num_lut_u64 != b->num_lut_u64) {
+        return false;
+    }
+    if (strncmp(a->name, b->name, sizeof(a->name)) != 0) {
+        return false;
+    }
+    for (uint32_t i = 0U; i < a->num_vals; ++i) {
+        if (a->vals[i].width != b->vals[i].width ||
+            a->vals[i].is_classical != b->vals[i].is_classical ||
+            strncmp(a->vals[i].name, b->vals[i].name, sizeof(a->vals[i].name)) != 0) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0U; i < a->num_inputs; ++i) {
+        if (a->inputs[i] != b->inputs[i]) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0U; i < a->num_outputs; ++i) {
+        if (a->outputs[i] != b->outputs[i]) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0U; i < a->num_ops; ++i) {
+        const flow_ir_op_t *oa = &a->ops[i];
+        const flow_ir_op_t *ob = &b->ops[i];
+        if (oa->kind != ob->kind || oa->num_ins != ob->num_ins || oa->out_val != ob->out_val ||
+            oa->lut_off != ob->lut_off || oa->lut_len != ob->lut_len || oa->p0 != ob->p0 ||
+            oa->p1 != ob->p1 || oa->p2 != ob->p2 || oa->p3 != ob->p3) {
+            return false;
+        }
+        for (uint16_t k = 0U; k < oa->num_ins && k < FLOW_IR_MAX_INS; ++k) {
+            if (oa->ins[k] != ob->ins[k]) {
+                return false;
+            }
+        }
+    }
+    for (uint32_t i = 0U; i < a->num_lut_u64; ++i) {
+        if (a->lut_pool[i] != b->lut_pool[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool node_cert_load_auto_bytes(flow_ir_prog_t *out, const uint8_t *buf, size_t len) {
+    /* flow_ir_load_bytes_fiber transparently decodes both legacy "FIR1" and packed "FIR2". */
+    return flow_ir_load_bytes_fiber(out, buf, len) == FLOW_IR_FIBER_COMMITTED;
+}
+
+static inline bool node_cert_load_auto_file(flow_ir_prog_t *out, const char *path,
+                                            uint8_t *scratch_buf, size_t scratch_cap) {
+    return flow_ir_load_file(out, path, scratch_buf, scratch_cap);
+}
+
+static inline bool node_cert_seal_cartesian_fir2(node_cert_ws_t *ws, const char *out_fir_path,
+                                                 node_cert_size_stats_t *stats) {
+    static uint8_t fir1_buf[FLOW_IR_MAX_FILE_BYTES];
+    static uint8_t rt_buf[FLOW_IR_MAX_FILE_BYTES];
+    static flow_ir_prog_t legacy_reloaded;
     if (ws == NULL || out_fir_path == NULL) {
         return false;
     }
     ws->ir_prog.mult = FLOW_IR_MULT_CARTESIAN;
     ws->ir_prog.flags = FLOW_IR_FLAG_CLEAN;
-    if (!flow_ir_encode_bytes(&ws->ir_prog, ws->wire_buf, sizeof(ws->wire_buf), &ws->wire_len)) {
+
+    size_t fir1_len = 0U;
+    if (!flow_ir_encode_bytes(&ws->ir_prog, fir1_buf, sizeof(fir1_buf), &fir1_len)) {
         return false;
     }
-    if (flow_ir_load_bytes_fiber(&ws->ir_reloaded, ws->wire_buf, ws->wire_len) !=
-        FLOW_IR_FIBER_COMMITTED) {
+    if (!flow_ir_encode_packed_bytes(&ws->ir_prog, ws->wire_buf, sizeof(ws->wire_buf),
+                                     &ws->wire_len)) {
         return false;
+    }
+    if (!node_cert_load_auto_bytes(&ws->ir_reloaded, ws->wire_buf, ws->wire_len)) {
+        return false;
+    }
+    if (!node_cert_progs_equal(&ws->ir_prog, &ws->ir_reloaded)) {
+        return false;
+    }
+    size_t rt_len = 0U;
+    if (!flow_ir_encode_packed_bytes(&ws->ir_reloaded, rt_buf, sizeof(rt_buf), &rt_len) ||
+        rt_len != ws->wire_len || memcmp(rt_buf, ws->wire_buf, ws->wire_len) != 0) {
+        return false;
+    }
+    if (!node_cert_load_auto_bytes(&legacy_reloaded, fir1_buf, fir1_len) ||
+        !node_cert_progs_equal(&ws->ir_prog, &legacy_reloaded)) {
+        return false;
+    }
+    if (!flow_ir_encode_bytes(&ws->ir_reloaded, rt_buf, sizeof(rt_buf), &rt_len) ||
+        rt_len != fir1_len || memcmp(rt_buf, fir1_buf, fir1_len) != 0) {
+        return false;
+    }
+    if (stats != NULL) {
+        stats->legacy_fir1_bytes = fir1_len;
+        stats->packed_fir2_bytes = ws->wire_len;
     }
     return flow_ir_write_bytes_file(out_fir_path, ws->wire_buf, ws->wire_len);
+}
+
+static inline bool node_cert_seal_cartesian_fir(node_cert_ws_t *ws, const char *out_fir_path) {
+    return node_cert_seal_cartesian_fir2(ws, out_fir_path, NULL);
 }
 
 static inline uint32_t node_cert_emit_concat2(flow_ir_prog_t *p, uint16_t width, uint32_t lo,
@@ -317,5 +422,9 @@ static inline bool node_cert_emit_json(const char *path, const char *name, const
     fprintf(fp, "}\n");
     return fclose(fp) == 0;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* NODE_CERT_H */
