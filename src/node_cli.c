@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include "flow_ir_io.h"
 #include "flow_wire_pack.h"
 #include "node.h"
 #include "node_cert.h"
@@ -42,21 +43,7 @@ static uint8_t g_cli_arena_wire[32768];
 static flow_ir_prog_t g_cli_ir_tmp;
 
 static bool node_cli_read_bin_file(const char *path, uint8_t *buf, size_t cap, size_t *out_len) {
-    if (path == NULL || buf == NULL || out_len == NULL || cap == 0U) {
-        return false;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (fp == NULL) {
-        return false;
-    }
-    size_t n = fread(buf, 1U, cap, fp);
-    int extra = fgetc(fp);
-    (void)fclose(fp);
-    if (extra != EOF) {
-        return false;
-    }
-    *out_len = n;
-    return true;
+    return flow_ir_read_bytes_file(path, buf, cap, out_len);
 }
 
 static bool node_cli_arena_pack_flwa(const NodeArena *arena, uint8_t *out, size_t out_cap,
