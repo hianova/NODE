@@ -37,7 +37,7 @@ def _find_elan_tool(name: str) -> Path:
     home_p = Path.home() / ".elan" / "bin" / name
     if home_p.exists():
         return home_p
-    return Path("/Users/kuangtalin/.elan/bin") / name
+    return Path.home() / ".elan" / "bin" / name
 
 
 LEAN = _find_elan_tool("lean")

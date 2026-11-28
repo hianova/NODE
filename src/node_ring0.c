@@ -205,8 +205,16 @@ void node_vm_init(node_vm_t *vm, uint32_t fuel_budget) {
 
 bool node_vm_grant_cap(node_vm_t *vm, uint32_t slot, uint32_t region_id, uint32_t base,
                        uint32_t len, uint32_t rights) {
-    if (vm == NULL || slot >= NODE_VM_MAX_CAPS || base > NODE_VM_MEM_WORDS ||
-        len > NODE_VM_MEM_WORDS - base) {
+    if (vm == NULL) {
+        return false;
+    }
+    if (slot >= NODE_VM_MAX_CAPS) {
+        return false;
+    }
+    if ((uint64_t)base > (uint64_t)NODE_VM_MEM_WORDS) {
+        return false;
+    }
+    if ((uint64_t)base + (uint64_t)len > (uint64_t)NODE_VM_MEM_WORDS) {
         return false;
     }
     vm->state.caps[slot].region_id = region_id;
@@ -228,11 +236,20 @@ bool node_vm_attenuate_cap(node_vm_t *vm, uint32_t dst_slot, uint32_t src_slot, 
     if ((new_rights & src.rights) != new_rights) {
         return false;
     }
-    if (src.base > NODE_VM_MEM_WORDS || src.len > NODE_VM_MEM_WORDS - src.base) {
+    uint64_t src_end = (uint64_t)src.base + (uint64_t)src.len;
+    if ((uint64_t)src.base > (uint64_t)NODE_VM_MEM_WORDS) {
         return false;
     }
-    if (new_base < src.base || new_base > src.base + src.len ||
-        new_len > (src.base + src.len) - new_base) {
+    if (src_end > (uint64_t)NODE_VM_MEM_WORDS) {
+        return false;
+    }
+    if (new_base < src.base) {
+        return false;
+    }
+    if ((uint64_t)new_base > src_end) {
+        return false;
+    }
+    if ((uint64_t)new_base + (uint64_t)new_len > src_end) {
         return false;
     }
     vm->state.caps[dst_slot].region_id = src.region_id;
@@ -1533,12 +1550,13 @@ void node_bft_init(node_bft_cluster_t *b, uint32_t n, uint32_t f, uint32_t byz_m
     b->n = (n > NODE_BFT_MAX_N) ? NODE_BFT_MAX_N : n;
     b->f = f;
     b->broken_quorum = broken_quorum;
-    if (broken_quorum != 0U) {
-        b->quorum = 2U * f;
-    } else if (b->n == 0U || f > 2U || (3U * f + 1U) > b->n) {
-        b->quorum = b->n + 1U;
-    } else {
-        b->quorum = 2U * f + 1U;
+    b->quorum = b->n + 1U;
+    if (f <= 2U) {
+        if (broken_quorum != 0U) {
+            b->quorum = 2U * f;
+        } else if (b->n != 0U && (UINT64_C(3) * (uint64_t)f + UINT64_C(1)) <= (uint64_t)b->n) {
+            b->quorum = 2U * f + 1U;
+        }
     }
     b->byz_mask = byz_mask;
     b->first_violation_tick = UINT32_MAX;

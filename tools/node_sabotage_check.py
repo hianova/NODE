@@ -82,9 +82,18 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M06_att_skip_bounds_check",
             "vm_attenuate",
-            "    if (new_base < src.base || new_base > src.base + src.len ||\n"
-            "        new_len > (src.base + src.len) - new_base) {",
-            "    if (false && new_base < src.base && new_len > src.len) {",
+            "    if (new_base < src.base) {\n"
+            "        return false;\n"
+            "    }\n"
+            "    if ((uint64_t)new_base > src_end) {\n"
+            "        return false;\n"
+            "    }\n"
+            "    if ((uint64_t)new_base + (uint64_t)new_len > src_end) {\n"
+            "        return false;\n"
+            "    }",
+            "    if (false && new_base < src.base && (uint64_t)new_len > src_end) {\n"
+            "        return false;\n"
+            "    }",
         ),
         # --- 3. vm_fuel_replay (3) ---
         NodeMutant(
@@ -332,7 +341,14 @@ def build_node_mutants() -> list[NodeMutant]:
         NodeMutant(
             "M31_bft_broken_quorum_2f",
             "bft_equivocation",
-            "    if (broken_quorum != 0U) {\n        b->quorum = 2U * f;\n    } else if (b->n == 0U || f > 2U || (3U * f + 1U) > b->n) {\n        b->quorum = b->n + 1U;\n    } else {\n        b->quorum = 2U * f + 1U;\n    }",
+            "    b->quorum = b->n + 1U;\n"
+            "    if (f <= 2U) {\n"
+            "        if (broken_quorum != 0U) {\n"
+            "            b->quorum = 2U * f;\n"
+            "        } else if (b->n != 0U && (UINT64_C(3) * (uint64_t)f + UINT64_C(1)) <= (uint64_t)b->n) {\n"
+            "            b->quorum = 2U * f + 1U;\n"
+            "        }\n"
+            "    }",
             "    (void)broken_quorum;\n    b->quorum = 2U * f;",
         ),
         NodeMutant(
